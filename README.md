@@ -92,25 +92,24 @@ A run creates a timestamped directory under `results/` (see `Infinite_War_Simula
 
 ```mermaid
 flowchart TD
-  A[main.py: build or load world] --> B[TickEngine init]
-  B --> C{UI enabled?}
-  C -->|yes| D[Viewer.run loop]
-  C -->|no| E[headless loop]
-  D --> F[TickEngine.run_tick]
+  A["main.py build or load world"] --> B["TickEngine init"]
+  B --> C{"UI enabled?"}
+  C -->|yes| D["Viewer run loop"]
+  C -->|no| E["Headless loop"]
+  D --> F["TickEngine run_tick"]
   E --> F
 
-  F --> G[Build observations (rays + rich tail)]
-  G --> H[Build action mask]
-  H --> I[Policy/value forward (bucketed; optional vmap)]
-  I --> J[Sample actions]
-  J --> K[Resolve movement conflicts]
-  K --> L[Combat + damage/deaths]
-  L --> M[Score/CP updates]
-  M --> N[PPO record_step + optional updates]
-  N --> O[Respawn step]
-  O --> P[Telemetry hooks + periodic flush]
-  P --> Q[Stats row written]
-
+  F --> G["Build observations rays and rich tail"]
+  G --> H["Build action mask"]
+  H --> I["Policy and value forward bucketed optional vmap"]
+  I --> J["Sample actions"]
+  J --> K["Resolve movement conflicts"]
+  K --> L["Combat damage and deaths"]
+  L --> M["Score and CP updates"]
+  M --> N["PPO record_step and optional updates"]
+  N --> O["Respawn step"]
+  O --> P["Telemetry hooks and periodic flush"]
+  P --> Q["Stats row written"]
 ```
 
 > Note: each labeled stage above corresponds to explicit blocks and helpers inside `TickEngine.run_tick` and its collaborators (see `Infinite_War_Simulation/engine/tick.py`).
