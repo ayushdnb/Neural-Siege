@@ -86,7 +86,7 @@ def build_mask(
     tyc = ty.clamp(0, H - 1)
 
     tgt_occ = grid[0][tyc, txc]  # (N,8,4)
-    enemy_r = (tgt_occ != 0.0) & (tgt_occ != 1.0) & (tgt_occ.to(torch.long) != teamv.view(N, 1, 1))
+    enemy_r = (tgt_occ != 1.0) & (tgt_occ.to(torch.long) != teamv.view(N, 1, 1))  # allow attacking empty cells (prediction)
     enemy_r &= inb_r  # enforce bounds
 
     # Unit gating: soldiers r=1; archers r<=ARCHER_RANGE

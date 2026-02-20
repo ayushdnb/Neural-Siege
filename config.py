@@ -71,7 +71,7 @@ TELEMETRY_WRITE_RUN_META: bool = _env_bool("FWS_TELEM_RUN_META", True)          
 TELEMETRY_WRITE_AGENT_STATIC: bool = _env_bool("FWS_TELEM_AGENT_STATIC", True)   # can grow; opt-in
 TELEMETRY_TICK_SUMMARY_EVERY: int = _env_int("FWS_TELEM_TICK_SUMMARY_EVERY", 0)   # 0=off (opt-in)
 # --- Frequencies (ticks) ---
-TELEMETRY_TICK_METRICS_EVERY: int = _env_int("FWS_TELEM_TICK_EVERY", 200)          # per-tick summary rows
+TELEMETRY_TICK_METRICS_EVERY: int = _env_int("FWS_TELEM_TICK_EVERY", 100)          # per-tick summary rows
 TELEMETRY_SNAPSHOT_EVERY: int = _env_int("FWS_TELEM_SNAPSHOT_EVERY", 100)        # grid occupancy snapshots
 TELEMETRY_REGISTRY_SNAPSHOT_EVERY: int = _env_int("FWS_TELEM_REG_EVERY", 100)    # registry snapshots
 TELEMETRY_VALIDATE_EVERY: int = _env_int("FWS_TELEM_VALIDATE_EVERY", 50)         # invariant checks
@@ -86,7 +86,7 @@ TELEMETRY_LOG_BIRTHS: bool = _env_bool("FWS_TELEM_BIRTHS", True)
 TELEMETRY_LOG_DEATHS: bool = _env_bool("FWS_TELEM_DEATHS", True)
 TELEMETRY_LOG_DAMAGE: bool = _env_bool("FWS_TELEM_DAMAGE", True)
 TELEMETRY_LOG_KILLS: bool = _env_bool("FWS_TELEM_KILLS", True)
-TELEMETRY_LOG_MOVES: bool = _env_bool("FWS_TELEM_MOVES", False)   # can be huge
+TELEMETRY_LOG_MOVES: bool = _env_bool("FWS_TELEM_MOVES", True)   # can be huge
 TELEMETRY_LOG_PPO: bool = _env_bool("FWS_TELEM_PPO", True)
 
 # Damage logging mode:
@@ -135,8 +135,8 @@ VMAP_DEBUG = _env_bool("FWS_VMAP_DEBUG", False)
 # 🌍 WORLD SCALE & MEMORY ALLOCATION
 # =============================================================================
 
-GRID_WIDTH  = _env_int("FWS_GRID_W", 100)
-GRID_HEIGHT = _env_int("FWS_GRID_H", 100)
+GRID_WIDTH  = _env_int("FWS_GRID_W", 64)
+GRID_HEIGHT = _env_int("FWS_GRID_H", 64)
 
 # START_AGENTS defines the initial drop. 500 per team = 1000 agents actively 
 # computing raycasts and attention matrices simultaneously. 
@@ -144,7 +144,7 @@ START_AGENTS_PER_TEAM = _env_int("FWS_START_PER_TEAM", 200)
 
 # MAX_AGENTS must be larger than START to accommodate the SoA (Struct of Arrays) 
 # memory pre-allocation for reinforcements/respawns.
-MAX_AGENTS  = _env_int("FWS_MAX_AGENTS", 700)
+MAX_AGENTS  = _env_int("FWS_MAX_AGENTS", 500)
 
 # 0 = run simulation math as fast as the CPU/GPU allows.
 TICK_LIMIT = _env_int("FWS_TICK_LIMIT", 0)
@@ -160,9 +160,9 @@ AGENT_FEATURES = 10
 
 # Increased walls to accommodate the massive 160x160 map. Creates distinct 
 # "lanes" and "choke points" for tactical combat.
-RANDOM_WALLS = _env_int("FWS_RAND_WALLS",9)
-WALL_SEG_MIN = _env_int("FWS_WALL_SEG_MIN", 10)
-WALL_SEG_MAX = _env_int("FWS_WALL_SEG_MAX", 47)
+RANDOM_WALLS = _env_int("FWS_RAND_WALLS",5)
+WALL_SEG_MIN = _env_int("FWS_WALL_SEG_MIN", 6)
+WALL_SEG_MAX = _env_int("FWS_WALL_SEG_MAX", 37)
 WALL_AVOID_MARGIN = _env_int("FWS_WALL_MARGIN", 3)
 
 MAP_WALL_STRAIGHT_PROB = _env_float("FWS_MAP_WALL_STRAIGHT_PROB", 0.75)
@@ -170,12 +170,12 @@ MAP_WALL_GAP_PROB      = _env_float("FWS_MAP_WALL_GAP_PROB", 0.08)
 
 # Heal Zones (The "Water holes"). Scaled up in count to support 1000 agents.
 HEAL_ZONE_COUNT      = _env_int("FWS_HEAL_COUNT", 16)
-HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 8/128)
-HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.002)
+HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 10/128)
+HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.0005)
 
 # Capture Points (The "King of the Hill" objective).
 CP_COUNT           = _env_int("FWS_CP_COUNT", 5)
-CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 10/160)
+CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 12/160)
 CP_REWARD_PER_TICK = _env_float("FWS_CP_REWARD", 0.01)
 
 # =============================================================================
@@ -217,8 +217,8 @@ META_ARCHER_HP_PER_TICK  = _env_float("FWS_META_ARCHER",  0.0005)
 # 👁️ SENSORS & INSTINCT (THE AI'S "EYES")
 # =============================================================================
 # Raycasting is the most CPU-heavy part of the simulation.
-VISION_RANGE_SOLDIER = _env_int("FWS_VISION_SOLDIER", 10)
-VISION_RANGE_ARCHER  = _env_int("FWS_VISION_ARCHER", 12) # Snipers need good eyes
+VISION_RANGE_SOLDIER = _env_int("FWS_VISION_SOLDIER", 6)
+VISION_RANGE_ARCHER  = _env_int("FWS_VISION_ARCHER", 8) # Snipers need good eyes
 
 VISION_RANGE_BY_UNIT = {
     UNIT_SOLDIER_ID: VISION_RANGE_SOLDIER,
@@ -228,7 +228,7 @@ RAYCAST_MAX_STEPS = max(max(VISION_RANGE_BY_UNIT.values()), 1)
 RAY_MAX_STEPS     = RAYCAST_MAX_STEPS
 
 # Instinct detects "Flanking" mathematically via local unit density.
-INSTINCT_RADIUS = _env_int("FWS_INSTINCT_RADIUS", 14)
+INSTINCT_RADIUS = _env_int("FWS_INSTINCT_RADIUS", 10)
 
 # =============================================================================
 # 🧩 TENSOR OBSERVATION LAYOUT (STRICT CONTRACT)
@@ -265,7 +265,7 @@ NUM_ACTIONS = _env_int("FWS_NUM_ACTIONS", 41)
 RESPAWN_ENABLED = _env_bool("FWS_RESPAWN", True)
 
 # New Wave-Based Respawn logic.
-RESP_FLOOR_PER_TEAM      = _env_int("FWS_RESP_FLOOR_PER_TEAM", 190) # Never let a team drop below 300
+RESP_FLOOR_PER_TEAM      = _env_int("FWS_RESP_FLOOR_PER_TEAM", 160) # Never let a team drop below 300
 RESP_MAX_PER_TICK        = _env_int("FWS_RESP_MAX_PER_TICK", 15)    # Smooth out spawn-lag
 RESP_PERIOD_TICKS        = _env_int("FWS_RESP_PERIOD_TICKS", 600)   # Reinforcement chopper arrives every 600 ticks
 RESP_PERIOD_BUDGET       = _env_int("FWS_RESP_PERIOD_BUDGET", 40)   # Drops 40 agents 
@@ -365,8 +365,8 @@ TEAM_BRAIN_MIX_SEED: int = _env_int("FWS_TEAM_BRAIN_MIX_SEED", int(globals().get
 # --- Transformer Hyperparameters ---
 # Pushed up for high "IQ". d_model=128 + 8 heads allows complex multi-modal 
 # processing of spatial rays and tactical tokens.
-TRON_D_MODEL       = _env_int("FWS_TRON_DMODEL", 64)  # High capacity memory
-TRON_HEADS         = _env_int("FWS_TRON_HEADS", 2)     # Parallel reasoning paths
+TRON_D_MODEL       = _env_int("FWS_TRON_DMODEL", 96)  # High capacity memory
+TRON_HEADS         = _env_int("FWS_TRON_HEADS", 8)     # Parallel reasoning paths
 TRON_DROPOUT       = _env_float("FWS_TRON_DROPOUT", 0.05)
 TRON_RAY_LAYERS    = _env_int("FWS_TRON_RAY_LAYERS", 2) 
 TRON_SEM_LAYERS    = _env_int("FWS_TRON_SEM_LAYERS", 2) 

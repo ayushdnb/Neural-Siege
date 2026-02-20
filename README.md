@@ -110,6 +110,7 @@ flowchart TD
   N --> O[Respawn step]
   O --> P[Telemetry hooks + periodic flush]
   P --> Q[Stats row written]
+
 ```
 
 > Note: each labeled stage above corresponds to explicit blocks and helpers inside `TickEngine.run_tick` and its collaborators (see `Infinite_War_Simulation/engine/tick.py`).
