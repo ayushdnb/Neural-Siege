@@ -1,114 +1,199 @@
 from __future__ import annotations
+# ^ Defers evaluation of type annotations. This is valuable for:
+#   - Forward references in type hints (types referenced before definition)
+#   - Cleaner runtime behavior when type checking is performed externally
+#   - Improved compatibility across Python versions and tooling
+
 # This import ensures that type hints are evaluated as string literals,
 # allowing forward references (e.g., 'TronBrain' in its own methods)
 # and making the code compatible with older Python versions.
 
 from typing import Dict, List, Tuple
-# Import common typing constructs for type hints:
-# Dict, List, Tuple are used to annotate function signatures and variables.
+# ^ Typing constructs used throughout:
+#   - Dict[K, V]: mapping from keys to values
+#   - List[T]: a list of items of type T
+#   - Tuple[A, B]: a fixed-length tuple of two items
 
 import math
-# Import the math module to use math.sqrt() for calculating initialization gain.
-# (Added by the patch)
+# ^ Used for math.sqrt(2.0), which is a common gain factor for orthogonal initialization
+#   when the network uses ReLU/GELU-like nonlinearities.
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# Core PyTorch imports:
-# - torch: main tensor library
-# - torch.nn: neural network modules (layers, containers)
-# - torch.nn.functional: functional operations like activations, loss functions
+# ^ Core PyTorch imports:
+#   - torch: tensors and general utilities
+#   - torch.nn: neural network modules (layers, containers)
+#   - torch.nn.functional: stateless neural network ops (activations, etc.)
 
 import config
-# Import the project's configuration module, which holds all hyperparameters
-# and constants (e.g., observation layout dimensions, TRON architecture settings,
-# semantic indices). This ensures consistency across the codebase.
+# ^ Project configuration module holding hyperparameters and constants.
+#   Centralizing these values prevents subtle mismatches between:
+#   - observation layout
+#   - model architecture
+#   - training runtime expectations
+
+
+# ============================================================================
+# Transformer block utilities used by TronBrain
+# ============================================================================
+# TronBrain is a transformer-style actor-critic network designed for
+# reinforcement learning policies with discrete actions (logits output).
+#
+# The transformer core is composed of two reusable building blocks:
+#   1) _SelfAttnBlock: self-attention + feed-forward, with residuals and LayerNorm
+#   2) _CrossAttnBlock: cross-attention + feed-forward, with residuals and LayerNorm
+#
+# Definitions (mathematical):
+#   Self-attention (single head) over a sequence X ∈ R^{B×S×D}:
+#     Q = XW_Q, K = XW_K, V = XW_V
+#     Attn(X) = softmax(QK^T / sqrt(d_k)) V
+#
+#   Cross-attention between a query sequence Qseq and a memory sequence M:
+#     Q = Qseq W_Q, K = M W_K, V = M W_V
+#     Attn(Qseq, M) = softmax(QK^T / sqrt(d_k)) V
+#
+# Multi-head attention:
+#   - Performs attention in multiple subspaces (heads) in parallel.
+#   - Each head uses d_k = D / n_heads.
+#   - Outputs are concatenated and projected back to D.
+#
+# Residual connections:
+#   - Add the sublayer output back to its input: x = x + sublayer(x)
+#   - Improve gradient flow and training stability in deep networks.
+#
+# LayerNorm:
+#   - Normalizes features across the last dimension D.
+#   - Helps maintain stable activation scales.
+# ============================================================================
 
 
 class _SelfAttnBlock(nn.Module):
-    """Pre-LN style transformer block: Self-Attention + Feed-Forward Network, with residual connections.
-    
-    Architecture:
-        x -> MultiHeadAttention -> LayerNorm(x + attn) -> FFN -> LayerNorm(x + ffn) -> output
     """
-    # This class implements a single transformer block with Pre-LayerNorm.
-    # It is used internally by TronBrain for self-attention processing.
-    # Pre-LN means LayerNorm is applied after the residual addition, which
-    # improves training stability, especially for deep transformers.
+    Pre-LN style transformer block: Self-Attention + Feed-Forward Network, with residual connections.
+
+    Architecture (as implemented in this class):
+        1) Self-attention: a = Attn(x, x, x)
+        2) Residual + LayerNorm: x = LN(x + a)
+        3) Feed-forward: f = FFN(x)
+        4) Residual + LayerNorm: x = LN(x + f)
+
+    Important note on terminology:
+    - The docstring says "Pre-LN", but the code applies LayerNorm *after* the residual addition:
+          x = norm1(x + a)
+          x = norm2(x + f)
+      This pattern is commonly described as "Post-LN" in transformer literature.
+    - Regardless of naming, the implementation is unambiguous and correct as written.
+
+    Shapes:
+        Input:  x ∈ R^{B×S×D}
+        Output: x ∈ R^{B×S×D}
+    """
 
     def __init__(self, d_model: int, n_heads: int, ffn_mult: int = 4) -> None:
-        """Initialize self-attention block.
-        
+        """
+        Initialize self-attention block.
+
         Args:
-            d_model: Model dimension (must be divisible by n_heads)
-            n_heads: Number of attention heads
-            ffn_mult: Multiplier for FFN hidden dimension (default: 4)
+            d_model:
+                Embedding dimension D for all tokens.
+                Must be divisible by n_heads for MultiheadAttention.
+
+            n_heads:
+                Number of attention heads.
+
+            ffn_mult:
+                Multiplier for the feed-forward hidden dimension.
+                FFN hidden dimension = ffn_mult * d_model.
+                The default (4×) is standard in transformer architectures.
         """
         super().__init__()
-        # Call the parent class (nn.Module) constructor.
 
-        # Multi-head self-attention layer. batch_first=True means input and output
-        # tensors have shape (batch_size, seq_len, d_model) – the typical format.
+        # Multi-head self-attention.
+        # batch_first=True means inputs are (B, S, D) rather than (S, B, D).
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
 
-        # First layer norm applied after adding attention residual (Pre-LN style).
+        # LayerNorm applied after attention residual.
         self.norm1 = nn.LayerNorm(d_model)
 
-        # Feed-forward network (FFN) with GELU activation.
+        # Feed-forward network:
+        #   Linear(D → 4D) → GELU → Linear(4D → D)
+        #
+        # GELU is a smooth non-linearity commonly used in modern transformers.
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_mult * d_model),  # Expand dimension by multiplier.
-            nn.GELU(),                                # Gaussian Error Linear Unit activation.
-            nn.Linear(ffn_mult * d_model, d_model),   # Project back to original dimension.
+            nn.Linear(d_model, ffn_mult * d_model),
+            nn.GELU(),
+            nn.Linear(ffn_mult * d_model, d_model),
         )
 
-        # Second layer norm applied after adding FFN residual.
+        # LayerNorm applied after FFN residual.
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply self-attention + FFN with pre-LN residuals.
-        
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            
-        Returns:
-            Output tensor of same shape as input
         """
-        # Self-attention with residual: compute attention output (a) without attention weights.
-        # need_weights=False saves computation by not returning attention matrices.
+        Apply self-attention + feed-forward with residuals and LayerNorm.
+
+        Args:
+            x:
+                Input token sequence of shape (B, S, D).
+
+        Returns:
+            Output token sequence of shape (B, S, D).
+
+        Mathematical interpretation:
+            Let x be the current representation of the sequence.
+            - Self-attention computes context-aware mixing across the S positions.
+            - FFN applies a position-wise nonlinear transformation.
+            - Residuals preserve information and help optimize deep stacks.
+        """
+        # Self-attention: Q=K=V=x.
+        # need_weights=False saves memory/compute by not returning attention matrices.
         a, _ = self.attn(x, x, x, need_weights=False)
 
-        # Pre-LN: add the attention output to the original input (residual connection),
-        # then apply layer normalization.
+        # Residual connection then LayerNorm.
         x = self.norm1(x + a)
 
-        # FFN with residual: apply FFN to the normalized output.
+        # Feed-forward transformation.
         f = self.ffn(x)
 
-        # Second pre-LN: add residual and normalize.
+        # Second residual then LayerNorm.
         x = self.norm2(x + f)
         return x
 
 
 class _CrossAttnBlock(nn.Module):
-    """Cross-Attention block: Query attends to Key-Value pairs, with FFN and residuals.
-    
-    Architecture:
-        q, kv -> CrossAttn -> LayerNorm(q + attn) -> FFN -> LayerNorm(q + ffn) -> output
     """
-    # This block is used for fusion, where semantic/decision tokens (as queries)
-    # attend to processed ray tokens (as keys/values). It has the same structure
-    # as _SelfAttnBlock but with separate query and key/value inputs.
+    Cross-Attention block: Query attends to Key-Value pairs, with FFN and residuals.
+
+    Architecture (as implemented):
+        1) Cross-attention: a = Attn(q, kv, kv)
+        2) Residual + LayerNorm: q = LN(q + a)
+        3) Feed-forward: f = FFN(q)
+        4) Residual + LayerNorm: q = LN(q + f)
+
+    Shapes:
+        q  ∈ R^{B×Sq×D}   (query sequence)
+        kv ∈ R^{B×Sk×D}   (memory/key-value sequence)
+        output has shape R^{B×Sq×D}
+
+    Purpose in TronBrain:
+        - Decision/Semantic/Instinct/Memory tokens (queries) attend to ray tokens (kv).
+        - This fuses perceptual information (rays) into the higher-level plan tokens.
+    """
 
     def __init__(self, d_model: int, n_heads: int, ffn_mult: int = 4) -> None:
-        """Initialize cross-attention block.
-        
+        """
+        Initialize cross-attention block.
+
         Args:
-            d_model: Model dimension (must be divisible by n_heads)
-            n_heads: Number of attention heads
-            ffn_mult: Multiplier for FFN hidden dimension (default: 4)
+            d_model:
+                Embedding dimension D for query and memory tokens.
+            n_heads:
+                Number of attention heads.
+            ffn_mult:
+                FFN expansion multiplier (default 4).
         """
         super().__init__()
-        # Same as self-attention block but used with separate query and key/value inputs.
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -119,72 +204,113 @@ class _CrossAttnBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        """Apply cross-attention where q attends to kv, followed by FFN.
-        
-        Args:
-            q: Query tensor of shape (batch_size, q_seq_len, d_model)
-            kv: Key/Value tensor of shape (batch_size, kv_seq_len, d_model)
-            
-        Returns:
-            Output tensor of same shape as q
         """
-        # Cross-attention: queries from q attend to keys/values from kv.
+        Apply cross-attention where q attends to kv, followed by FFN.
+
+        Args:
+            q:
+                Query tokens of shape (B, Sq, D).
+                In TronBrain this is typically the plan token sequence.
+
+            kv:
+                Key/Value tokens of shape (B, Sk, D).
+                In TronBrain this is the ray token sequence.
+
+        Returns:
+            Updated query tokens of shape (B, Sq, D).
+
+        Mathematical interpretation:
+            Each query token learns to "read" from the ray memory using attention weights:
+                weights = softmax(QK^T / sqrt(d_k))
+            producing a weighted sum of V that is added back to q via residual.
+        """
         a, _ = self.attn(q, kv, kv, need_weights=False)
-
-        # Pre-LN residual: add attention output to q, then normalize.
         q = self.norm1(q + a)
-
-        # FFN with residual.
         f = self.ffn(q)
         q = self.norm2(q + f)
         return q
 
 
+# ============================================================================
+# TronBrain: Transformer-based actor-critic for per-agent control
+# ============================================================================
+
 class TronBrain(nn.Module):
     """
     TRON v1 Transformer-based brain for per-agent control.
-    
-    Architecture has 4 stages:
-      1. Ray encoder: Self-attention over ray tokens to extract spatial features
-      2. Semantic encoder: Self-attention over semantic tokens (own, world, zone, team, combat, instinct)
-      3. Fusion: Semantic+decision tokens cross-attend to processed ray tokens
-      4. Readout: Decision tokens only -> logits and value
-    
-    Forward contract (MUST stay): forward(obs) -> (logits, value)
-    
-    Observation layout (from config):
-      [rays_flat (num_rays * ray_feat_dim) | rich_base(23) | instinct(4)]
+
+    This model implements an actor-critic architecture suitable for PPO:
+      - Actor produces action logits (for a discrete categorical policy).
+      - Critic produces a scalar value estimate.
+
+    Pipeline overview (4 stages):
+      1) Ray encoder:
+           Self-attention over ray tokens (perceptual input).
+      2) Semantic encoder:
+           Self-attention over "plan tokens":
+             decision tokens + semantic tokens + instinct token + memory token
+      3) Fusion:
+           Cross-attention where plan tokens attend to ray tokens.
+      4) Readout:
+           Only decision tokens are used to produce logits and value.
+
+    Forward contract (strict):
+        forward(obs) -> (logits, value)
+        logits: (B, act_dim)
+        value:  (B, 1)
+
+    Observation layout assumption (from config):
+      [rays_flat (num_rays * ray_feat_dim) | rich_base | instinct]
+
+    Notation:
+      B  = batch size
+      Nr = num_rays
+      Fr = ray_feat_dim
+      D  = d_model
+      A  = act_dim
     """
 
     def __init__(self, obs_dim: int, act_dim: int) -> None:
-        """Initialize TronBrain with observation and action dimensions.
-        
+        """
+        Initialize TronBrain with observation and action dimensions.
+
         Args:
-            obs_dim: Total observation dimension (must match config.OBS_DIM)
-            act_dim: Action dimension (number of discrete actions)
-            
+            obs_dim:
+                Total observation dimension. This implementation requires it to match:
+                  (num_rays * ray_feat_dim) + rich_base_dim + instinct_dim
+
+            act_dim:
+                Number of discrete actions.
+
         Raises:
-            ValueError: If obs_dim doesn't match expected layout or config invalid
-            RuntimeError: If semantic indices missing from config
+            ValueError:
+                If obs_dim does not match the expected layout or transformer config is invalid.
+
+            RuntimeError:
+                If SEMANTIC_RICH_BASE_INDICES is missing or semantic groups are misconfigured.
         """
         super().__init__()
-        # Store dimensions as integers (ensures they are not tensors).
+
+        # Store dimensions as integers (avoid accidental tensor shapes).
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
 
-        # --- Observation layout invariants (must match Phase 1-3 pipeline) ---
-        # These constants are loaded from config and define the observation structure.
-        # Use getattr with defaults to be robust, but actual config should set them.
+        # ------------------------------------------------------------------
+        # Observation layout invariants
+        # ------------------------------------------------------------------
+        # These values define how the flat observation is interpreted.
         self.num_rays = int(getattr(config, "RAY_TOKEN_COUNT", 32))
         self.ray_feat_dim = int(getattr(config, "RAY_FEAT_DIM", 8))
         self.rich_base_dim = int(getattr(config, "RICH_BASE_DIM", 23))
         self.instinct_dim = int(getattr(config, "INSTINCT_DIM", 4))
 
-        # Compute expected total observation dimension.
+        # Total rays flat dimension.
         self.rays_flat_dim = self.num_rays * self.ray_feat_dim
+
+        # Total expected observation width.
         self.expected_obs_dim = self.rays_flat_dim + self.rich_base_dim + self.instinct_dim
 
-        # Validate that the provided obs_dim matches the expected layout.
+        # Validate the caller-provided obs_dim matches the computed layout.
         if self.obs_dim != self.expected_obs_dim:
             raise ValueError(
                 f"TronBrain obs_dim mismatch: got obs_dim={self.obs_dim}, "
@@ -192,8 +318,10 @@ class TronBrain(nn.Module):
                 f"+{self.rich_base_dim}+{self.instinct_dim}."
             )
 
-        # Semantic partition indices must exist (Phase 3 output)
-        # These indices define how to slice rich_base into semantic tokens.
+        # ------------------------------------------------------------------
+        # Semantic partition indices
+        # ------------------------------------------------------------------
+        # SEMANTIC_RICH_BASE_INDICES defines how rich_base is partitioned into semantic groups.
         idx_map = getattr(config, "SEMANTIC_RICH_BASE_INDICES", None)
         if idx_map is None:
             raise RuntimeError(
@@ -202,7 +330,9 @@ class TronBrain(nn.Module):
             )
         self._idx_map: Dict[str, List[int]] = dict(idx_map)
 
-        # --- TRON hyperparams (config-driven, safe defaults) ---
+        # ------------------------------------------------------------------
+        # Transformer hyperparameters (config-driven)
+        # ------------------------------------------------------------------
         d_model = int(getattr(config, "TRON_D_MODEL", 64))
         n_heads = int(getattr(config, "TRON_HEADS", 4))
         ray_layers = int(getattr(config, "TRON_RAY_LAYERS", 4))
@@ -214,28 +344,32 @@ class TronBrain(nn.Module):
         if d_model <= 0 or n_heads <= 0:
             raise ValueError("Invalid TRON config: TRON_D_MODEL and TRON_HEADS must be positive.")
         if d_model % n_heads != 0:
-            raise ValueError(f"Invalid TRON config: TRON_D_MODEL ({d_model}) must be divisible by TRON_HEADS ({n_heads}).")
+            raise ValueError(
+                f"Invalid TRON config: TRON_D_MODEL ({d_model}) must be divisible by TRON_HEADS ({n_heads})."
+            )
 
         self.d_model = d_model
         self.n_heads = n_heads
 
-        # --- Ray input projection ---
-        # Each ray has ray_feat_dim features; we first normalize then project to d_model.
+        # ------------------------------------------------------------------
+        # Ray input projection
+        # ------------------------------------------------------------------
+        # Raw ray features (Fr) are normalized and projected to model dimension D.
         self.ray_in_norm = nn.LayerNorm(self.ray_feat_dim)
         self.ray_in_proj = nn.Linear(self.ray_feat_dim, d_model)
-        # Learned positional embedding for ray directions (one per ray). Shape: (1, num_rays, d_model)
-        # Initialized with small random values (std=0.02) to break symmetry.
+
+        # Direction embedding acts like a learnable positional encoding for rays.
+        # Shape (1, Nr, D), broadcast over batch.
         self.ray_dir_embed = nn.Parameter(torch.randn(1, self.num_rays, d_model) * 0.02)
 
-        # --- Semantic token embeddings (variable input dims -> d_model) ---
-        # Expected semantic groups from Phase 3:
-        #   own_context, world_context, zone_context, team_context, combat_context
-        # Each group has different dimensionality, projected to common d_model.
+        # ------------------------------------------------------------------
+        # Semantic token embeddings
+        # ------------------------------------------------------------------
+        # Each semantic group corresponds to a distinct slice of rich_base.
+        # Each slice may have a different dimension; all are projected to D.
         sem_keys = ["own_context", "world_context", "zone_context", "team_context", "combat_context"]
         self._sem_keys = sem_keys
 
-        # Create LayerNorm and Linear layers for each semantic group.
-        # ModuleDict allows us to store modules with string keys.
         self.sem_in_norm = nn.ModuleDict()
         self.sem_in_proj = nn.ModuleDict()
         for k in sem_keys:
@@ -246,210 +380,246 @@ class TronBrain(nn.Module):
             self.sem_in_norm[k] = nn.LayerNorm(din)
             self.sem_in_proj[k] = nn.Linear(din, d_model)
 
-        # Instinct embedding (4 features -> d_model)
+        # Instinct embedding: maps instinct_dim -> D.
         self.instinct_in_norm = nn.LayerNorm(self.instinct_dim)
         self.instinct_in_proj = nn.Linear(self.instinct_dim, d_model)
 
-        # Memory token (learnable, not from observation)
-        # Acts as a persistent memory across time steps. Initialized to zeros.
+        # ------------------------------------------------------------------
+        # Learned plan tokens
+        # ------------------------------------------------------------------
+        # Memory token: a single token representing persistent internal state.
         self.memory_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        # Decision tokens (learnable): 3 tokens for different decision-making roles
-        # D0: tactical decisions, D1: objective decisions, D2: safety decisions
-        # Initialized with small random values.
+        # Decision tokens: three learned tokens used for final readout.
+        # These act as "designated slots" that the model can use to store decision-relevant state.
         self.decision_tokens = nn.Parameter(torch.randn(1, 3, d_model) * 0.02)
 
-        # --- Stage blocks ---
-        # Stage 1: Ray encoder - processes ray tokens independently (self-attention among rays).
+        # ------------------------------------------------------------------
+        # Stage blocks
+        # ------------------------------------------------------------------
+        # Stage 1: Ray encoder (self-attention among rays).
         self.ray_encoder = nn.ModuleList([_SelfAttnBlock(d_model, n_heads) for _ in range(ray_layers)])
 
-        # Stage 2: Semantic encoder - processes combined token sequence (self-attention among all tokens).
+        # Stage 2: Semantic encoder (self-attention among plan tokens).
         self.sem_encoder = nn.ModuleList([_SelfAttnBlock(d_model, n_heads) for _ in range(sem_layers)])
 
-        # Stage 3: Fusion - semantic tokens attend to ray tokens (cross-attention).
+        # Stage 3: Fusion (cross-attention, plan tokens attend to rays).
         self.fusion = nn.ModuleList([_CrossAttnBlock(d_model, n_heads) for _ in range(fusion_layers)])
 
-        # --- Readout from decision tokens only ---
-        # MLP that takes concatenated decision tokens (3 * d_model) -> logits and value.
+        # ------------------------------------------------------------------
+        # Readout heads (decision tokens only)
+        # ------------------------------------------------------------------
+        # Concatenate 3 decision tokens into (B, 3D), then apply MLP -> logits/value.
         self.read_fc0 = nn.Linear(3 * d_model, mlp_hidden)
         self.read_fc1 = nn.Linear(mlp_hidden, mlp_hidden)
-        self.actor = nn.Linear(mlp_hidden, self.act_dim)   # Policy head: produces action logits.
-        self.critic = nn.Linear(mlp_hidden, 1)             # Value head: predicts state value.
+        self.actor = nn.Linear(mlp_hidden, self.act_dim)
+        self.critic = nn.Linear(mlp_hidden, 1)
 
-        # Initialize all weights with orthogonal initialization (PPO-friendly).
+        # Initialize weights.
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Orthogonal init (PPO-friendly): stable early gradients + high initial policy entropy."""
-        # Gain for hidden layers: sqrt(2) is a good default for GELU/ReLU activations
-        # (He et al. initialization scaling, but here applied to orthogonal init).
+        """
+        Orthogonal initialization (PPO-friendly):
+          - Hidden linear layers use gain = sqrt(2).
+          - Actor head uses gain = 0.01 to keep initial logits small.
+          - Critic head uses gain = 1.0.
+
+        Mathematical background:
+        - Orthogonal initialization constructs weight matrices whose columns/rows are orthonormal.
+          For square matrices: W^T W ≈ I.
+        - This helps preserve the norm of signals propagated through linear layers:
+            ||Wx|| ≈ ||x||   (in expectation, depending on shape and gain)
+        - With nonlinear activations, a gain is used to maintain variance after the nonlinearity.
+          sqrt(2) is a common heuristic for ReLU-like activations and is often used with GELU.
+
+        PPO-specific motivation:
+        - Small actor gain biases the initial policy toward near-uniform distributions:
+            If logits ≈ 0, softmax(logits) ≈ uniform
+          which improves early exploration.
+        """
         gain_hidden = math.sqrt(2.0)
 
-        # Iterate over all modules in the network.
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Apply orthogonal initialization to the weight matrix.
-                # Orthogonal init preserves gradient norms and helps with training stability.
                 nn.init.orthogonal_(m.weight, gain=gain_hidden)
                 if m.bias is not None:
-                    # Biases are initialized to zero.
                     nn.init.zeros_(m.bias)
 
-        # Special handling for the actor head (policy logits).
-        # Use a very small gain (0.01) so that initial logits are near zero,
-        # producing near-uniform action probabilities and encouraging exploration.
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         if self.actor.bias is not None:
             nn.init.zeros_(self.actor.bias)
 
-        # Special handling for the critic head (value function).
-        # Use standard gain (1.0) for the value output.
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         if self.critic.bias is not None:
             nn.init.zeros_(self.critic.bias)
 
-    # ---- embedding helpers (stable + AMP-friendly) --------------------
-    # These helper methods embed raw features into d_model space with layer norm and linear projection.
-    # They explicitly cast to float32 for layer norm stability, then back to the projection's dtype.
-    # This is important when using Automatic Mixed Precision (AMP) because LayerNorm expects float32.
+    # ------------------------------------------------------------------
+    # Embedding helpers (stable + AMP-friendly)
+    # ------------------------------------------------------------------
+    # These helpers apply LayerNorm in float32 then cast back to projection dtype.
+    # This pattern is commonly used for mixed precision training:
+    #   - LayerNorm computations are more stable in fp32.
+    #   - Linear projections can run in fp16/bf16 for performance.
 
     def _embed_rays(self, rays_raw: torch.Tensor) -> torch.Tensor:
-        """Embed raw ray features to d_model dimension.
-        
-        Args:
-            rays_raw: Raw ray features of shape (B, num_rays, ray_feat_dim)
-            
-        Returns:
-            Embedded rays of shape (B, num_rays, d_model)
         """
-        # Apply layer norm in float32 for numerical stability, then project.
+        Embed raw ray features to model dimension.
+
+        Args:
+            rays_raw:
+                (B, num_rays, ray_feat_dim)
+
+        Returns:
+            (B, num_rays, d_model)
+        """
         x = self.ray_in_norm(rays_raw.float())
-        # Cast to the dtype of the linear layer's weights (e.g., float16 if using AMP) before projection.
         x = self.ray_in_proj(x.to(dtype=self.ray_in_proj.weight.dtype))
         return x
 
     def _embed_sem(self, x_raw: torch.Tensor, key: str) -> torch.Tensor:
-        """Embed raw semantic features for a specific group to d_model dimension.
-        
-        Args:
-            x_raw: Raw semantic features of shape (B, group_dim)
-            key: Semantic group name (e.g., "own_context")
-            
-        Returns:
-            Embedded semantic features of shape (B, d_model)
         """
-        n = self.sem_in_norm[key]   # LayerNorm for this group.
-        p = self.sem_in_proj[key]   # Linear projection for this group.
-        x = n(x_raw.float())         # Normalize in float32.
-        x = p(x.to(dtype=p.weight.dtype))  # Project to d_model.
+        Embed raw semantic features for a given group.
+
+        Args:
+            x_raw:
+                (B, group_dim) raw semantic slice selected from rich_base.
+            key:
+                semantic group name.
+
+        Returns:
+            (B, d_model)
+        """
+        n = self.sem_in_norm[key]
+        p = self.sem_in_proj[key]
+        x = n(x_raw.float())
+        x = p(x.to(dtype=p.weight.dtype))
         return x
 
     def _embed_instinct(self, inst_raw: torch.Tensor) -> torch.Tensor:
-        """Embed raw instinct features to d_model dimension.
-        
+        """
+        Embed raw instinct features to model dimension.
+
         Args:
-            inst_raw: Raw instinct features of shape (B, instinct_dim)
-            
+            inst_raw:
+                (B, instinct_dim)
+
         Returns:
-            Embedded instinct features of shape (B, d_model)
+            (B, d_model)
         """
         x = self.instinct_in_norm(inst_raw.float())
         x = self.instinct_in_proj(x.to(dtype=self.instinct_in_proj.weight.dtype))
         return x
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through TronBrain.
-        
-        Args:
-            obs: Flat observation tensor of shape (batch_size, OBS_DIM)
-                 Layout: [rays_flat | rich_base | instinct]
-                 
-        Returns:
-            Tuple of (logits, value):
-                logits: Action logits of shape (batch_size, act_dim)
-                value: Value prediction of shape (batch_size, 1)
-                
-        Raises:
-            RuntimeError: If observation shape doesn't match expected dimensions
-                         or if output shapes are incorrect
         """
-        # ----- hard invariants -----
-        # Verify observation is 2D (batch, features).
+        Forward pass through TronBrain.
+
+        Args:
+            obs:
+                Flat observation tensor of shape (B, expected_obs_dim).
+                Layout: [rays_flat | rich_base | instinct]
+
+        Returns:
+            logits:
+                (B, act_dim) policy logits for a discrete action distribution.
+            value:
+                (B, 1) scalar state value estimate.
+
+        Implementation stages:
+            1) Split flat observation into rays/rich_base/instinct.
+            2) Encode ray tokens with self-attention.
+            3) Build plan tokens (decision + semantic + instinct + memory) and encode them.
+            4) Fuse plan tokens with ray tokens via cross-attention.
+            5) Read out logits/value from decision tokens only.
+
+        Strict invariants:
+            - Input shape must match expected layout.
+            - Output shapes must match PPO runtime expectations exactly.
+        """
+        # ------------------------------------------------------------------
+        # Input shape checks (fail loudly on schema mismatch)
+        # ------------------------------------------------------------------
         if obs.dim() != 2:
             raise RuntimeError(f"TronBrain.forward expects obs 2D [B,F], got shape={tuple(obs.shape)}")
         B, Fdim = int(obs.size(0)), int(obs.size(1))
-        # Verify feature dimension matches expected layout.
         if Fdim != self.expected_obs_dim:
             raise RuntimeError(
                 f"TronBrain.forward obs dim mismatch: got F={Fdim}, expected {self.expected_obs_dim}."
             )
 
-        # ----- split observation into components -----
-        # Split according to layout: [rays_flat | rich_base | instinct]
+        # ------------------------------------------------------------------
+        # Split observation into components
+        # ------------------------------------------------------------------
         rays_flat = obs[:, : self.rays_flat_dim]
         rich_base = obs[:, self.rays_flat_dim : self.rays_flat_dim + self.rich_base_dim]
         instinct = obs[:, self.rays_flat_dim + self.rich_base_dim : self.expected_obs_dim]
 
-        # ----- Stage 1: Ray Processing -----
-        # Reshape flat rays to (B, num_rays, ray_feat_dim).
+        # ------------------------------------------------------------------
+        # Stage 1: Ray processing (self-attention among rays)
+        # ------------------------------------------------------------------
         rays_raw = rays_flat.view(B, self.num_rays, self.ray_feat_dim)
-        # Embed rays to d_model and add directional embeddings.
         ray_tok = self._embed_rays(rays_raw)
         ray_tok = ray_tok + self.ray_dir_embed.to(dtype=ray_tok.dtype, device=ray_tok.device)
 
-        # Apply self-attention blocks to process ray tokens.
         for blk in self.ray_encoder:
             ray_tok = blk(ray_tok)
 
-        # ----- Stage 2: Semantic Token Construction -----
-        # Build semantic tokens from rich_base partitions.
+        # ------------------------------------------------------------------
+        # Stage 2: Semantic token construction + plan token encoding
+        # ------------------------------------------------------------------
+        # Build semantic tokens by selecting configured index subsets from rich_base.
+        # Each group yields a token of shape (B, 1, D).
         sem_tokens: List[torch.Tensor] = []
         for k in self._sem_keys:
-            # Extract indices for this semantic group from config.
             idxs = self._idx_map[k]
-            # Gather features using indices (maintains order from config).
-            # Use index_select on dimension 1 (feature dimension) with a tensor of indices.
             xk = rich_base.index_select(dim=1, index=torch.tensor(idxs, device=rich_base.device, dtype=torch.long))
-            # Embed and add sequence dimension (unsqueeze(1)) to get (B, 1, D).
             sem_tokens.append(self._embed_sem(xk, k).unsqueeze(1))
 
-        # Embed instinct token from tail.
-        inst_tok = self._embed_instinct(instinct).unsqueeze(1)  # (B, 1, D)
+        # Instinct token.
+        inst_tok = self._embed_instinct(instinct).unsqueeze(1)
 
-        # Prepare decision and memory tokens.
-        # Expand learned tokens to batch size.
-        dec = self.decision_tokens.expand(B, -1, -1).to(device=obs.device)  # (B, 3, D)
-        mem = self.memory_token.expand(B, -1, -1).to(device=obs.device)    # (B, 1, D)
+        # Expand learned tokens to batch dimension.
+        dec = self.decision_tokens.expand(B, -1, -1).to(device=obs.device)
+        mem = self.memory_token.expand(B, -1, -1).to(device=obs.device)
 
-        # Concatenate all tokens: decisions (3), semantics (5), instinct (1), memory (1)
-        sem = torch.cat(sem_tokens, dim=1)  # (B, 5, D)
-        tok = torch.cat([dec, sem, inst_tok, mem], dim=1)  # (B, 3+5+1+1=10, D)
+        # Concatenate plan token sequence:
+        #   3 decision + 5 semantic + 1 instinct + 1 memory = 10 tokens
+        sem = torch.cat(sem_tokens, dim=1)
+        tok = torch.cat([dec, sem, inst_tok, mem], dim=1)
 
-        # Apply self-attention to token sequence.
+        # Self-attention over plan token sequence.
         for blk in self.sem_encoder:
             tok = blk(tok)
 
-        # ----- Stage 3: Fusion (Cross-Attention) -----
-        # Semantic+decision tokens attend to processed ray tokens.
+        # ------------------------------------------------------------------
+        # Stage 3: Fusion (plan tokens attend to rays)
+        # ------------------------------------------------------------------
         for blk in self.fusion:
             tok = blk(tok, ray_tok)
 
-        # ----- Stage 4: Readout -----
-        # Extract only decision tokens (first 3) for readout.
+        # ------------------------------------------------------------------
+        # Stage 4: Readout (decision tokens only)
+        # ------------------------------------------------------------------
+        # Decision tokens are the first 3 tokens in tok.
         dec_out = tok[:, :3, :].reshape(B, 3 * self.d_model)
 
-        # MLP head with GELU activations.
         h = F.gelu(self.read_fc0(dec_out))
         h = F.gelu(self.read_fc1(h))
 
-        # Final projections to logits and value.
-        logits = self.actor(h)              # (B, act_dim)
-        value = self.critic(h)              # (B, 1)
+        logits = self.actor(h)
+        value = self.critic(h)
 
-        # ----- Final shape asserts (critical "DO NOT BREAK" invariants) -----
+        # ------------------------------------------------------------------
+        # Output shape checks (strict PPO contract)
+        # ------------------------------------------------------------------
         if logits.dim() != 2 or logits.size(0) != B or logits.size(1) != self.act_dim:
-            raise RuntimeError(f"Bad logits shape from TronBrain: got {tuple(logits.shape)}, expected ({B},{self.act_dim})")
+            raise RuntimeError(
+                f"Bad logits shape from TronBrain: got {tuple(logits.shape)}, expected ({B},{self.act_dim})"
+            )
         if value.dim() != 2 or value.size(0) != B or value.size(1) != 1:
-            raise RuntimeError(f"Bad value shape from TronBrain: got {tuple(value.shape)}, expected ({B},1)")
+            raise RuntimeError(
+                f"Bad value shape from TronBrain: got {tuple(value.shape)}, expected ({B},1)"
+            )
 
         return logits, value

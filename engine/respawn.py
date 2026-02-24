@@ -1,14 +1,46 @@
 from __future__ import annotations
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# This directive postpones evaluation of type annotations.
+# Practical effect: annotations are treated as strings (or otherwise deferred),
+# which avoids forward-reference issues and can reduce import-time circularity.
+# This is especially valuable in larger codebases where modules refer to each
+# other (e.g., registry ↔ brains ↔ environment).
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict   
+# dataclass:
+#   - Provides automatic generation of __init__, __repr__, __eq__, etc.
+#   - Encourages "configuration-as-data" patterns (clear, explicit fields).
+# field(default_factory=...):
+#   - Ensures a new default is computed at instantiation time, not at import time.
+#   - Crucial when defaults depend on config values that may differ per run.
+
+from typing import Optional, Tuple, List, Dict
+# Optional[T] means T or None
+# Tuple[A, B] indicates fixed-size tuple with (A, B)
+# List[T] and Dict[K, V] for container typing (readability + static checking)
+
 import random
 import copy
 import random
+# NOTE: "random" is imported twice. This is redundant but harmless.
+# Per your instruction, we do not remove or modify any code.
+# Redundant imports can occur from merges or rapid iteration.
 
 import torch
 import torch.jit
+# torch.jit:
+#   - Enables TorchScript compilation / scripting.
+#   - ScriptModule is the runtime type for scripted modules.
+# In this file, TorchScript awareness is used primarily to infer brain type.
 
 import config
+# Global configuration object/module.
+# This file repeatedly uses getattr(config, "...", default) to:
+#   - preserve backward compatibility if config lacks a field,
+#   - allow optional knobs,
+#   - avoid crashing when config is incomplete.
+
 from .agent_registry import (
     AgentsRegistry,
     COL_ALIVE,
@@ -20,13 +52,31 @@ from .agent_registry import (
     COL_VISION,
     COL_ATK,
     COL_UNIT,
-    COL_AGENT_ID,   
+    COL_AGENT_ID,
     TEAM_RED_ID,
     TEAM_BLUE_ID,
 )
+# This import supplies:
+#   - AgentsRegistry: core state container for agents (tensor storage + brains list).
+#   - Column indices (COL_*) that index into reg.agent_data.
+#   - TEAM_* constants: numeric IDs used as team labels in tensors & grid occupancy.
+#
+# A key design pattern here is "struct-of-arrays":
+#   - agent_data is a 2D tensor of shape (N_agents, N_fields)
+#   - each field is a column (indexed by COL_* constants)
+# This is GPU-friendly and vectorizable.
+
 from agent.transformer_brain import TransformerBrain, scripted_transformer_brain
 from agent.tron_brain import TronBrain
 from agent.mirror_brain import MirrorBrain
+# "Brains" are policy/value networks or decision modules controlling agents.
+# The code supports multiple architectures:
+#   - TransformerBrain (learnable, not necessarily TorchScript)
+#   - scripted_transformer_brain (TorchScript-ready version for non-PPO mode)
+#   - TronBrain, MirrorBrain (likely lighter MLP-based / heuristic / special policies)
+#
+# The policy selection logic is team-aware when TEAM_BRAIN_ASSIGNMENT is enabled.
+
 
 # ----------------------------------------------------------------------
 # Respawn configuration dataclass (extended with new parameters)
@@ -35,56 +85,137 @@ from agent.mirror_brain import MirrorBrain
 class RespawnCfg:
     """Configuration for agent respawning.
 
-    This dataclass combines the original simple probabilistic respawn
-    parameters with the new advanced controller parameters. All fields
-    have defaults pulled from the global config module for backward
-    compatibility and ease of use.
+    DESIGN INTENT
+    -------------
+    This configuration object defines "what respawn should do" rather than
+    embedding constants directly into logic. This approach yields:
+
+      1) Reproducibility:
+         - One can record or version the configuration for experiments.
+
+      2) Backward compatibility:
+         - Legacy fields remain, even if not used by the new controller.
+
+      3) Separation of concerns:
+         - Controller logic is parameterized; changes in behavior can be driven
+           by config changes rather than code edits.
+
+    COMPATIBILITY STRATEGY
+    ----------------------
+    For many fields, defaults are pulled from `config` via getattr(..., default).
+    This ensures:
+      - If a new config knob does not exist, a safe default is used.
+      - Older config.py files still run without modification.
+
+    NOTE ON TYPES
+    -------------
+    Fields are typed with bool / int / float for clarity and tooling.
+    At runtime, the implementation frequently casts config values using int(...)
+    or float(...), which ensures predictable types even if config values are
+    accidentally provided as strings or NumPy scalars.
     """
+
     # Master switch
     enabled: bool = True
+    # If enabled is False, the controller performs no respawn actions.
 
     # ---------- Legacy simple probabilistic fields ----------
-    prob_per_dead_per_tick: float = 0.05      # Not used in new controller, kept for API stability
-    spawn_tries: int = 200                    # Maximum attempts to find a free cell
-    mutation_std: float = 0.02                 # Noise std when mutating cloned brains
-    clone_prob: float = 0.50                   # Probability to clone an existing agent instead of creating a fresh brain
-    use_team_elite: bool = True                 # Whether to consider only alive agents from the same team as parents
-    reset_optimizer_on_respawn: bool = True     # Whether to reset optimizers (for PPO)
+    prob_per_dead_per_tick: float = 0.05
+    # Legacy knob: originally would spawn each dead agent with some probability.
+    # In the new controller logic, this is explicitly "not used" but is kept so:
+    #   - existing configs do not break,
+    #   - external callers relying on this field do not fail attribute access.
+
+    spawn_tries: int = 200
+    # Maximum attempts to sample a free spawn cell. This is used by the location
+    # picker. If too low, spawns may fail frequently in crowded maps.
+    # If too high, worst-case CPU time per spawn increases.
+
+    mutation_std: float = 0.02
+    # Standard deviation of Gaussian noise added to cloned brain parameters.
+    # If parameters θ are mutated in-place, typical perturbation is:
+    #     θ ← θ + ε,   where ε ~ Normal(0, σ^2)
+    # "std" is σ (sigma). Larger σ increases exploration but may destabilize.
+
+    clone_prob: float = 0.50
+    # Probability of cloning an existing alive agent (parent) rather than creating
+    # a fresh brain. This implements a simplistic evolutionary mechanism:
+    #   - cloning preserves successful policies,
+    #   - mutation introduces variation.
+
+    use_team_elite: bool = True
+    # Whether to consider only alive agents from the same team as parents.
+    # NOTE: In this code, parents are already filtered by same team; this flag is
+    # retained but not actively referenced in the selection logic shown.
+
+    reset_optimizer_on_respawn: bool = True
+    # In PPO training pipelines, each agent might have an optimizer state.
+    # Resetting avoids mixing momentum/Adam statistics across distinct individuals.
+    # Here, the code sets reg.optimizers[slot] = None (if optimizers exist),
+    # which implies the training loop will recreate optimizers when needed.
 
     # ---------- New controller fields ----------
     floor_per_team: int = field(default_factory=lambda: int(getattr(config, "RESP_FLOOR_PER_TEAM", 50)))
-    """Minimum desired number of alive agents per team; if below, respawn tries to fill up."""
+    # Minimum number of alive agents per team. If alive count falls below this
+    # floor, the controller will attempt to respawn until floor is reached (subject
+    # to caps and cooldown).
 
     max_per_tick: int = field(default_factory=lambda: int(getattr(config, "RESP_MAX_PER_TICK", 5)))
-    """Maximum number of respawns per team per tick."""
+    # Hard cap on how many agents per team may be spawned in a single tick.
+    # Prevents sudden bursts that:
+    #   - cause large compute spikes,
+    #   - dramatically change environment density in one step.
 
     period_ticks: int = field(default_factory=lambda: int(getattr(config, "RESP_PERIOD_TICKS", 500)))
-    """Interval (in ticks) at which a periodic respawn budget is distributed."""
+    # The controller has a periodic "budget distribution" mechanism. Every
+    # period_ticks, it allocates a number of respawns across teams based on their
+    # current alive counts (inverse proportional split).
 
     period_budget: int = field(default_factory=lambda: int(getattr(config, "RESP_PERIOD_BUDGET", 20)))
-    """Total number of respawns to distribute among teams every period_ticks."""
+    # How many respawns total (across teams) to allocate each time a period elapses.
+    # The split across teams is computed by _inverse_split(...).
 
     cooldown_ticks: int = field(default_factory=lambda: int(getattr(config, "RESP_HYST_COOLDOWN_TICKS", 30)))
-    """Cooldown after reaching the floor for a team before another floor‑based respawn is allowed."""
+    # A hysteresis mechanism: once a team climbs back to the floor, the controller
+    # waits cooldown_ticks before applying floor-based spawning again.
+    # This reduces oscillations:
+    #   - without cooldown, small fluctuations around the floor could trigger
+    #     respawn almost every tick.
 
     wall_margin: int = field(default_factory=lambda: int(getattr(config, "RESP_WALL_MARGIN", 2)))
-    """Minimum distance from the grid border for spawn positions."""
+    # Spawn positions must be at least wall_margin cells away from the borders.
+    # This prevents immediate wall collisions or degenerate behavior near edges.
 
     # Unit type configuration (pulled from config)
     unit_soldier: int = field(default_factory=lambda: int(getattr(config, "UNIT_SOLDIER", 1)))
     unit_archer: int = field(default_factory=lambda: int(getattr(config, "UNIT_ARCHER", 2)))
+
     spawn_archer_ratio: float = field(default_factory=lambda: float(getattr(config, "SPAWN_ARCHER_RATIO", 0.40)))
+    # Probability of spawning an archer rather than a soldier.
+
     soldier_hp: float = field(default_factory=lambda: float(getattr(config, "SOLDIER_HP", 1.0)))
     soldier_atk: float = field(default_factory=lambda: float(getattr(config, "SOLDIER_ATK", 0.05)))
     archer_hp: float = field(default_factory=lambda: float(getattr(config, "ARCHER_HP", 1.0)))
     archer_atk: float = field(default_factory=lambda: float(getattr(config, "ARCHER_ATK", 0.02)))
+
     vision_soldier: int = field(default_factory=lambda: int(getattr(config, "VISION_RANGE_BY_UNIT", {}).get(1, 10)))
     vision_archer: int = field(default_factory=lambda: int(getattr(config, "VISION_RANGE_BY_UNIT", {}).get(2, 15)))
+    # Vision ranges come from a dict in config (VISION_RANGE_BY_UNIT) if present.
+    # If config does not define it, fall back to reasonable defaults.
+
 
 # ----------------------------------------------------------------------
 # Global counter for rare mutation events
 # ----------------------------------------------------------------------
 _respawn_counter = 0
+# This is a module-level counter shared across all controller instances.
+# Meaning:
+#   - If you create a new RespawnController, the counter does NOT reset.
+#   - Rare mutation triggers on every 1000th respawn globally across teams.
+# Rationale:
+#   - Provides occasional "punctuated" variability, akin to rare genetic mutation.
+# Caveat:
+#   - Global state can be surprising in multi-simulation or multi-thread usage.
 
 
 # ----------------------------------------------------------------------
@@ -98,9 +229,27 @@ class TeamCounts:
 
 
 def _team_counts(reg: AgentsRegistry) -> TeamCounts:
-    """Return the number of alive agents for each team."""
+    """Return the number of alive agents for each team.
+
+    METHOD
+    ------
+    - Reads reg.agent_data (a tensor containing per-agent attributes).
+    - Defines "alive" as COL_ALIVE > 0.5, implying COL_ALIVE is stored as float
+      (0.0 or 1.0) rather than boolean.
+    - Counts alive agents where COL_TEAM equals TEAM_RED_ID or TEAM_BLUE_ID.
+
+    PERFORMANCE
+    -----------
+    This uses vectorized tensor operations:
+      alive = (d[:, COL_ALIVE] > 0.5)
+      red   = sum(alive & team_is_red)
+    which is significantly faster than Python loops, especially for large N.
+    """
     d = reg.agent_data
     alive = (d[:, COL_ALIVE] > 0.5)
+
+    # alive & (team == red) yields a boolean tensor.
+    # sum().item() converts tensor -> Python number.
     red = int((alive & (d[:, COL_TEAM] == TEAM_RED_ID)).sum().item())
     blue = int((alive & (d[:, COL_TEAM] == TEAM_BLUE_ID)).sum().item())
     return TeamCounts(red=red, blue=blue)
@@ -110,6 +259,37 @@ def _inverse_split(a: int, b: int, budget: int) -> Tuple[int, int]:
     """
     Split a budget inversely proportional to the two numbers.
     Used to give more respawns to the team with fewer alive agents.
+
+    MATHEMATICAL FORMULATION
+    ------------------------
+    Let a = alive count for team A, b = alive count for team B.
+    We define weights inversely proportional to counts:
+
+        w_a = 1/a
+        w_b = 1/b
+
+    Total weight:
+
+        S = w_a + w_b = 1/a + 1/b
+
+    Allocate budget to team A as:
+
+        q_a = round( budget * w_a / S )
+
+    And team B gets the remainder:
+
+        q_b = budget - q_a
+
+    PROPERTIES
+    ----------
+    - If a < b then 1/a > 1/b, so q_a tends to be larger.
+    - If a == b then q_a ≈ budget/2.
+    - The rounding step ensures q_a is integer.
+    - Using "remainder" ensures q_a + q_b == budget exactly.
+
+    SAFETY
+    ------
+    The code clamps a and b to at least 1 to avoid division by zero.
     """
     a = max(1, a)
     b = max(1, b)
@@ -119,16 +299,37 @@ def _inverse_split(a: int, b: int, budget: int) -> Tuple[int, int]:
 
 
 def _cap(n: int, cfg: RespawnCfg) -> int:
-    """Clamp a desired respawn count to the per‑tick maximum."""
+    """Clamp a desired respawn count to the per-tick maximum.
+
+    This is a small but important control:
+      - n may be very large if a team collapses.
+      - cfg.max_per_tick bounds the immediate impact per tick.
+
+    Returned value is in [0, cfg.max_per_tick].
+    """
     return max(0, min(n, cfg.max_per_tick))
+
 
 # ----------------------------------------------------------------------
 # Team brain selection (supports exclusive split and mixed teams)
 # ----------------------------------------------------------------------
 
 _TEAM_BRAIN_MIX_COUNTER = {TEAM_RED_ID: 0, TEAM_BLUE_ID: 0}
+# Per-team counter used for deterministic alternation strategies.
+# Because it is module-level, it persists across controller instances.
 
 def _make_team_mix_rng(team_id: float):
+    # This function constructs a random number generator (RNG) used when the
+    # team brain assignment mode uses probabilistic mixing.
+    #
+    # If TEAM_BRAIN_MIX_SEED == 0:
+    #   - Use SystemRandom(), which draws entropy from the OS.
+    #   - This is non-deterministic across runs (not reproducible).
+    #
+    # Otherwise:
+    #   - Use random.Random(seed + salt) for deterministic behavior.
+    #   - "salt" ensures red and blue do not share identical RNG streams even if
+    #     base seed is the same.
     seed = int(getattr(config, "TEAM_BRAIN_MIX_SEED", 0))
     if seed == 0:
         return random.SystemRandom()
@@ -139,11 +340,30 @@ _TEAM_BRAIN_MIX_RNG = {
     TEAM_RED_ID: _make_team_mix_rng(TEAM_RED_ID),
     TEAM_BLUE_ID: _make_team_mix_rng(TEAM_BLUE_ID),
 }
+# Dictionary mapping team_id -> RNG instance.
 
 def _resolve_team_brain_kind_from_team(team_id: float) -> str:
+    # Determine the "brain kind" to use for a team.
+    #
+    # config knobs:
+    #   TEAM_BRAIN_ASSIGNMENT_MODE:
+    #     - "exclusive" / "split" / "team":
+    #         red  -> tron
+    #         blue -> mirror
+    #     - "mix" / "hybrid" / "both":
+    #         choose tron/mirror per spawn using a chosen strategy.
+    #
+    # TEAM_BRAIN_MIX_STRATEGY:
+    #   - "alternate" / "roundrobin" / "rr":
+    #       deterministic alternation, controlled by _TEAM_BRAIN_MIX_COUNTER
+    #   - "random" / "prob" / "probabilistic":
+    #       draw from RNG with probability p_tron
+    #
+    # If team_id is neither red nor blue, fall back to config.BRAIN_KIND.
     mode = str(getattr(config, "TEAM_BRAIN_ASSIGNMENT_MODE", "exclusive")).strip().lower()
 
     if mode in ("exclusive", "split", "team"):
+        # "Exclusive" means each team has a fixed architecture assignment.
         if team_id == TEAM_RED_ID:
             return "tron"
         if team_id == TEAM_BLUE_ID:
@@ -151,25 +371,39 @@ def _resolve_team_brain_kind_from_team(team_id: float) -> str:
         return str(getattr(config, "BRAIN_KIND", "tron")).strip().lower()
 
     if mode in ("mix", "hybrid", "both"):
+        # "Mix" means within a given team we may alternate or randomly choose.
         strategy = str(getattr(config, "TEAM_BRAIN_MIX_STRATEGY", "alternate")).strip().lower()
 
         if strategy in ("alternate", "roundrobin", "rr"):
             i = _TEAM_BRAIN_MIX_COUNTER.get(team_id, 0)
             _TEAM_BRAIN_MIX_COUNTER[team_id] = i + 1
+            # Even indices -> tron, odd indices -> mirror
             return "tron" if (i % 2 == 0) else "mirror"
 
         if strategy in ("random", "prob", "probabilistic"):
             p_tron = float(getattr(config, "TEAM_BRAIN_MIX_P_TRON", 0.5))
+            # Clamp probability into [0, 1] for safety.
             p_tron = max(0.0, min(1.0, p_tron))
             rng = _TEAM_BRAIN_MIX_RNG.get(team_id, random.SystemRandom())
             return "tron" if (rng.random() < p_tron) else "mirror"
 
+        # If config sets an unknown strategy string, crash loudly.
+        # This is appropriate because misconfiguration should not silently degrade.
         raise ValueError(f"Unknown TEAM_BRAIN_MIX_STRATEGY={strategy!r}")
 
+    # Unknown mode is also a configuration error.
     raise ValueError(f"Unknown TEAM_BRAIN_ASSIGNMENT_MODE={mode!r}")
 
 def _infer_kind_from_parent(parent: torch.nn.Module) -> Optional[str]:
-    # ScriptModule counts as transformer for our purposes
+    # Attempt to infer the architecture "kind" from a parent module instance.
+    #
+    # Why do this?
+    # - If in "mix" mode, cloning should often preserve architecture.
+    # - This prevents loading weights into an incompatible model type.
+    #
+    # Note: torch.jit.ScriptModule is treated as "transformer" here.
+    # This is a pragmatic classification: ScriptModule is a compiled model,
+    # and the only scripted model mentioned in this file is transformer-based.
     if isinstance(parent, torch.jit.ScriptModule):
         return "transformer"
     if isinstance(parent, TronBrain):
@@ -180,24 +414,49 @@ def _infer_kind_from_parent(parent: torch.nn.Module) -> Optional[str]:
         return "transformer"
     return None
 
+
 # ----------------------------------------------------------------------
-# Brain creation and cloning (preserves team‑specific assignment)
+# Brain creation and cloning (preserves team-specific assignment)
 # ----------------------------------------------------------------------
 def _new_brain(device: torch.device, *, team_id: Optional[float] = None) -> torch.nn.Module:
     """Create a new brain module.
 
-    - Non-PPO: scripted transformer (existing behavior).
-    - PPO:
-        If TEAM_BRAIN_ASSIGNMENT is enabled and team_id is known:
-            - exclusive: red=tron, blue=mirror (old)
-            - mix: per-team mixed assignment (alternate/random)
-        Otherwise: falls back to BRAIN_KIND.
+    HIGH-LEVEL BEHAVIOR
+    -------------------
+    This function decides which model architecture to instantiate based on:
+      - PPO_ENABLED (training mode)
+      - TEAM_BRAIN_ASSIGNMENT (team-specific assignment enabled)
+      - TEAM_BRAIN_ASSIGNMENT_MODE (exclusive vs mix)
+      - BRAIN_KIND fallback
+
+    OBSERVATION AND ACTION SPACES
+    -----------------------------
+    obs_dim = OBS_DIM: dimensionality of observation vector.
+    act_dim = NUM_ACTIONS: size of discrete action space.
+    These values are read from config using getattr to avoid KeyError if missing.
+
+    POLICY MODE SPLIT
+    -----------------
+    - Non-PPO mode:
+        returns scripted_transformer_brain(...), then .to(device)
+      This suggests inference-optimized brain with TorchScript compatibility.
+
+    - PPO mode:
+        selects "brain_kind" (tron/mirror/transformer) and instantiates that class.
+
+    TEAM-SPECIFIC ASSIGNMENT
+    ------------------------
+    If TEAM_BRAIN_ASSIGNMENT is True and team_id is provided:
+      brain_kind is derived by _resolve_team_brain_kind_from_team(team_id)
+    else:
+      brain_kind is config.BRAIN_KIND
     """
     obs_dim = int(getattr(config, "OBS_DIM", 0))
     act_dim = int(getattr(config, "NUM_ACTIONS", 41))
 
     is_ppo = bool(getattr(config, "PPO_ENABLED", False))
     if not is_ppo:
+        # Non-PPO path: scripted transformer brain (existing behavior).
         return scripted_transformer_brain(obs_dim, act_dim).to(device)
 
     team_assign = bool(getattr(config, "TEAM_BRAIN_ASSIGNMENT", True))
@@ -206,10 +465,12 @@ def _new_brain(device: torch.device, *, team_id: Optional[float] = None) -> torc
     else:
         brain_kind = str(getattr(config, "BRAIN_KIND", "tron")).strip().lower()
 
+    # Instantiate the chosen architecture and move to device.
     if brain_kind == "transformer":
         return TransformerBrain(obs_dim, act_dim).to(device)
     if brain_kind == "mirror":
         return MirrorBrain(obs_dim, act_dim).to(device)
+    # Default case falls back to TronBrain.
     return TronBrain(obs_dim, act_dim).to(device)
 
 
@@ -222,10 +483,35 @@ def _clone_brain(
 ) -> torch.nn.Module:
     """Clone a parent brain.
 
-    - Non-PPO: try deepcopy, else fall back to fresh.
-    - PPO:
-        * exclusive mode: may force architecture by team (old behavior)
-        * mix mode: preserve parent's architecture when possible
+    OVERVIEW
+    --------
+    This function produces a "child" brain from a parent brain, with behavior
+    depending on whether PPO is enabled.
+
+    Non-PPO:
+      - Attempt to deepcopy(parent).
+      - If deepcopy fails, return a fresh brain (_new_brain).
+
+    PPO:
+      - Determine the target brain_kind using:
+          a) team assignment mode (exclusive vs mix)
+          b) parent's inferred kind (when in mix mode)
+          c) fallback to config.BRAIN_KIND
+      - Instantiate a new module of that kind.
+      - Load weights only if architecture is compatible.
+
+    WHY INSTANTIATE A NEW MODULE IN PPO MODE?
+    ----------------------------------------
+    Deepcopy of PyTorch modules is not always reliable or efficient.
+    Additionally, optimizer state and internal buffers may behave poorly if
+    copied improperly. Creating a clean child module and selectively copying
+    state_dict is a robust and explicit approach.
+
+    WHY CONDITIONAL load_state_dict?
+    --------------------------------
+    state_dict compatibility requires matching parameter names and shapes.
+    Loading weights into a different architecture would raise errors or,
+    worse, silently misalign if forced (not done here).
     """
     if parent is None:
         return _new_brain(device, team_id=team_id)
@@ -236,8 +522,11 @@ def _clone_brain(
     is_ppo = bool(getattr(config, "PPO_ENABLED", False))
     if not is_ppo:
         try:
+            # deepcopy attempts to duplicate the Python object graph.
+            # May fail for modules holding non-copyable resources.
             return copy.deepcopy(parent)
         except Exception:
+            # Fallback ensures system remains functional.
             return _new_brain(device, team_id=team_id)
 
     team_assign = bool(getattr(config, "TEAM_BRAIN_ASSIGNMENT", True))
@@ -250,12 +539,16 @@ def _clone_brain(
         if mode in ("exclusive", "split", "team"):
             brain_kind = _resolve_team_brain_kind_from_team(float(team_id))
         else:
-            # mix: keep parent architecture if we can
+            # mix: keep parent architecture if we can; otherwise use team resolver.
             brain_kind = parent_kind or _resolve_team_brain_kind_from_team(float(team_id))
     else:
         brain_kind = str(getattr(config, "BRAIN_KIND", "tron")).strip().lower()
 
-    # Instantiate + load weights only if compatible
+    # Instantiate + load weights only if compatible.
+    #
+    # This ensures:
+    #   - The returned module is fresh (no shared references).
+    #   - Parameters match expected shapes for the chosen class.
     if brain_kind == "transformer":
         child = TransformerBrain(obs_dim, act_dim).to(device)
         if isinstance(parent, (torch.jit.ScriptModule, TransformerBrain)):
@@ -278,7 +571,30 @@ def _clone_brain(
 
 @torch.no_grad()
 def _perturb_brain_(brain: torch.nn.Module, std: float) -> None:
-    """Add small Gaussian noise to all trainable parameters."""
+    """Add small Gaussian noise to all trainable parameters.
+
+    IMPORTANT DECORATOR: @torch.no_grad()
+    -------------------------------------
+    This disables gradient tracking within this function, which is desirable because:
+      - This is not a learning update; it is a mutation / perturbation operation.
+      - Avoids polluting autograd graphs and saves memory.
+
+    MATHEMATICAL MEANING
+    --------------------
+    For each trainable parameter tensor p (a vector or matrix of weights),
+    we perform an in-place update:
+
+        p ← p + N(0, std^2)   elementwise
+
+    Where torch.randn_like(p) produces samples from N(0, 1) for each element.
+    Multiplying by std scales to N(0, std^2).
+
+    ENGINEERING NOTES
+    -----------------
+    - Mutation is applied only if p.requires_grad is True.
+      This avoids perturbing frozen layers or buffers.
+    - In-place add_ is used for efficiency.
+    """
     if std <= 0.0:
         return
     for p in brain.parameters():
@@ -290,7 +606,35 @@ def _perturb_brain_(brain: torch.nn.Module, std: float) -> None:
 # Spawn cell selection (with wall margin)
 # ----------------------------------------------------------------------
 def _cell_free(grid: torch.Tensor, x: int, y: int, cfg: RespawnCfg) -> bool:
-    """Check if a cell is free for spawning (no wall, no agent)."""
+    """Check if a cell is free for spawning (no wall, no agent).
+
+    GRID CONTRACT (as documented elsewhere in the project)
+    -----------------------------------------------------
+    grid is shaped (C, H, W) with:
+      grid[0, y, x] = occupancy code:
+        0.0 empty
+        1.0 wall
+        2.0 red occupant
+        3.0 blue occupant
+      grid[2, y, x] = slot id (agent index) or -1.0 if empty
+
+    WALL MARGIN
+    -----------
+    The function enforces:
+      cfg.wall_margin <= x < W - cfg.wall_margin
+      cfg.wall_margin <= y < H - cfg.wall_margin
+
+    This ensures spawns do not occur too close to borders.
+
+    WHY .item()?
+    ------------
+    grid[...] returns a scalar tensor.
+    .item() converts it into a Python number for comparisons.
+    This is convenient but note:
+      - .item() triggers a device-to-host sync if grid is on GPU.
+      - For high-performance spawning at scale, one might prefer vectorized
+        operations. Here the spawn count per tick is capped, so overhead is likely acceptable.
+    """
     H, W = grid.shape[1], grid.shape[2]
     return (cfg.wall_margin <= x < W - cfg.wall_margin and
             cfg.wall_margin <= y < H - cfg.wall_margin and
@@ -299,18 +643,55 @@ def _cell_free(grid: torch.Tensor, x: int, y: int, cfg: RespawnCfg) -> bool:
 
 
 def _pick_uniform(grid: torch.Tensor, cfg: RespawnCfg) -> Tuple[int, int]:
-    """Randomly sample a free cell with uniform distribution."""
+    """Randomly sample a free cell with uniform distribution.
+
+    METHOD
+    ------
+    Rejection sampling:
+      - Sample (x, y) uniformly from allowed interior region.
+      - Accept if _cell_free is True.
+      - Repeat up to cfg.spawn_tries times.
+
+    EXPECTATION
+    -----------
+    If free-space ratio is high, expected tries is small.
+    If grid is dense (few free cells), tries may be near spawn_tries and fail.
+
+    FAILURE MODE
+    ------------
+    Returns (-1, -1) if no free cell is found within the try limit.
+    Caller must interpret x < 0 as failure (as done in _respawn_some).
+
+    NOTE ON RANDOMNESS
+    ------------------
+    This uses Python's random module, not torch RNG.
+    This means:
+      - randomness is not tied to torch seeds unless user also seeds random.
+      - distribution is CPU-side.
+    """
     H, W = grid.shape[1], grid.shape[2]
     for _ in range(cfg.spawn_tries):
         x = random.randint(cfg.wall_margin, W - cfg.wall_margin - 1)
         y = random.randint(cfg.wall_margin, H - cfg.wall_margin - 1)
         if _cell_free(grid, x, y, cfg):
             return x, y
-    return -1, -1  
+    return -1, -1
 
 
 def _pick_location(grid: torch.Tensor, cfg: RespawnCfg) -> Tuple[int, int]:
-    """Main entry point for spawn cell selection. Currently uniform."""
+    """Main entry point for spawn cell selection. Currently uniform.
+
+    ARCHITECTURE NOTE
+    -----------------
+    This wrapper exists to allow future extension:
+      - spawn near team base
+      - spawn away from enemies
+      - spawn with spatial clustering / dispersion
+      - spawn near objectives (e.g., capture points)
+
+    Maintaining a single entry point makes it easier to change spawn policy
+    without refactoring call sites.
+    """
     return _pick_uniform(grid, cfg)
 
 
@@ -318,12 +699,36 @@ def _pick_location(grid: torch.Tensor, cfg: RespawnCfg) -> Tuple[int, int]:
 # Unit type and stats (from config)
 # ----------------------------------------------------------------------
 def _choose_unit(cfg: RespawnCfg) -> int:
-    """Randomly choose a unit type based on spawn_archer_ratio."""
+    """Randomly choose a unit type based on spawn_archer_ratio.
+
+    Let r = cfg.spawn_archer_ratio in [0, 1].
+    Draw u ~ Uniform(0, 1).
+      - If u < r => choose archer
+      - Else    => choose soldier
+
+    This yields P(archer) = r, P(soldier) = 1 - r.
+
+    NOTE
+    ----
+    This uses Python RNG; see earlier note about reproducibility.
+    """
     return cfg.unit_archer if random.random() < cfg.spawn_archer_ratio else cfg.unit_soldier
 
 
 def _unit_stats(unit_id: int, cfg: RespawnCfg) -> Tuple[float, float, int]:
-    """Return (hp, atk, vision_range) for the given unit type."""
+    """Return (hp, atk, vision_range) for the given unit type.
+
+    This maps unit_id -> base stats.
+
+    The code is intentionally simple:
+      - If archer: use archer_hp, archer_atk, vision_archer
+      - Otherwise: use soldier_hp, soldier_atk, vision_soldier
+
+    DESIGN NOTE
+    -----------
+    This function centralizes stat mapping so that future changes (more unit types,
+    dynamic stats, scaling, etc.) have a single choke point.
+    """
     if unit_id == cfg.unit_archer:
         return cfg.archer_hp, cfg.archer_atk, cfg.vision_archer
     return cfg.soldier_hp, cfg.soldier_atk, cfg.vision_soldier
@@ -344,28 +749,71 @@ def _write_agent_to_registry(
     vision: int,
     brain: torch.nn.Module,
 ) -> None:
-    """Fill the registry tensors and brain list for a newly spawned agent."""
+    """Fill the registry tensors and brain list for a newly spawned agent.
+
+    REGISTRY LAYOUT ASSUMPTION
+    --------------------------
+    AgentsRegistry is assumed to contain:
+      - reg.agent_data: tensor of shape (N, D) storing numeric attributes
+      - reg.brains: list-like container mapping slot -> brain module
+      - reg.device: torch.device for module placement
+      - reg.get_next_id(): method returning unique agent identifier
+
+    This function updates:
+      (1) agent_data columns for the given slot
+      (2) agent_uids side-tensor if present (preferred storage for unique IDs)
+      (3) reg.brains and reg.optimizers if present
+
+    WHY BOTH agent_uids AND COL_AGENT_ID?
+    -------------------------------------
+    The code indicates a design evolution:
+      - agent_data may be float16/float32; storing large integer IDs in float16
+        risks overflow, rounding, or inf.
+      - So a robust int64 tensor (reg.agent_uids) is used if available.
+      - The legacy float column remains for display/debug but is clamped.
+    """
+
+    # Mark as alive. The system uses float flags: alive > 0.5.
     reg.agent_data[slot, COL_ALIVE] = 1.0
+
+    # Assign team identifier (likely 2.0 for red and 3.0 for blue, though actual
+    # numeric values come from TEAM_* constants).
     reg.agent_data[slot, COL_TEAM] = team_id
+
+    # Store location. x and y are stored as floats (consistent with the tensor dtype).
     reg.agent_data[slot, COL_X] = float(x)
     reg.agent_data[slot, COL_Y] = float(y)
+
+    # Initialize HP and HP_MAX.
+    # HP_MAX represents maximum HP capacity; initial spawn sets HP=HP_MAX.
     reg.agent_data[slot, COL_HP] = hp
     reg.agent_data[slot, COL_HP_MAX] = hp
+
+    # Vision stored as float to match tensor dtype (even though semantically int).
     reg.agent_data[slot, COL_VISION] = float(vision)
+
+    # Attack power is stored as float.
     reg.agent_data[slot, COL_ATK] = atk
+
+    # Unit type stored as float (semantically categorical).
     reg.agent_data[slot, COL_UNIT] = float(unit_id)
 
     # B7: Assign a fresh agent_id for this newly spawned individual.
     # get_next_id() is assumed to be provided by AgentsRegistry.
     new_aid = reg.get_next_id()
+
     # Store true UID in int64 side-tensor (robust even if agent_data is float16).
     if hasattr(reg, "agent_uids"):
         reg.agent_uids[slot] = int(new_aid)
+
     # Keep legacy float column as display-only (clamp to avoid inf when dtype is float16).
+    # torch.finfo(dtype).max gives the maximum finite representable value for that dtype.
+    # For float16, max is ~65504. Large IDs beyond that would become inf without clamping.
     try:
         max_f = torch.finfo(reg.agent_data.dtype).max
         reg.agent_data[slot, COL_AGENT_ID] = float(min(float(new_aid), float(max_f)))
     except Exception:
+        # If dtype is not floating or finfo fails, store directly.
         reg.agent_data[slot, COL_AGENT_ID] = float(new_aid)
 
     # Replace brain and clear optimizer (optimizer will be recreated by PPO if needed)
@@ -384,66 +832,124 @@ def _respawn_some(
     team_id: float,
     count: int,
     cfg: RespawnCfg,
-    tick: int,                                 # B5: added tick parameter
-    meta_out: Optional[List[Dict[str, object]]] = None,   # B5: added meta_out parameter
+    tick: int,
+    meta_out: Optional[List[Dict[str, object]]] = None,
 ) -> int:
     """
     Attempt to spawn up to `count` agents of the given team.
 
-    Returns the number actually spawned (may be less due to lack of free cells).
+    RETURNS
+    -------
+    int: number of agents actually spawned.
+         This may be less than requested due to:
+           - insufficient dead slots,
+           - no free spawn locations found,
+           - early termination on sampling failure.
+
+    SIDE EFFECTS
+    ------------
+    - Mutates reg.agent_data (revives slots).
+    - Mutates reg.brains (replaces brain modules).
+    - Mutates reg.optimizers (sets to None when present).
+    - Mutates grid to reflect occupancy/hp/slot-id at spawn location.
+    - Appends metadata dictionaries into meta_out if provided.
+
+    IMPORTANT: @torch.no_grad()
+    ---------------------------
+    Respawning is not a differentiable learning step. Disabling gradients:
+      - avoids autograd memory overhead,
+      - prevents accidental graph creation if tensors are on GPU.
     """
     global _respawn_counter
 
+    # Trivial guard: do nothing if count is non-positive.
     if count <= 0:
         return 0
 
-    # Find dead slots (alive == 0) that belong to the same team (optional, but safe)
+    # Find dead slots (alive == 0).
     data = reg.agent_data
     alive = (data[:, COL_ALIVE] > 0.5)
     dead_slots = (~alive).nonzero(as_tuple=False).squeeze(1)
+    # nonzero(...).squeeze(1) yields a 1D tensor of indices.
+
     if dead_slots.numel() == 0:
+        # No available slots to respawn into.
         return 0
 
-    # Gather potential parents (alive agents of the same team)
+    # Gather potential parents (alive agents of the same team).
+    # This produces indices into reg.brains / reg.agent_data.
     parents = (alive & (data[:, COL_TEAM] == team_id)).nonzero(as_tuple=False).squeeze(1)
 
     spawned = 0
-    # We will iterate over dead slots sequentially; stop when we have spawned enough or run out.
+
+    # Iterate sequentially over dead slots. This is deterministic given dead_slots
+    # order, but the spawn locations and clone selection introduce randomness.
     for k in range(min(count, dead_slots.numel())):
         slot = int(dead_slots[k].item())
+
+        # Choose spawn coordinates.
         x, y = _pick_location(grid, cfg)
-        if x < 0:  # no free cell found
+        if x < 0:
+            # If location selection fails, break early.
+            # This prevents repeated failures and wasted computation.
             break
 
-        # Choose unit type and base stats
+        # Choose unit type and get base stats.
         unit_id = _choose_unit(cfg)
         hp0, atk0, vision0 = _unit_stats(unit_id, cfg)
 
-        # Rare mutation event (every 1000th respawn globally)
+        # Rare mutation event (every 1000th respawn globally).
+        #
+        # This introduces occasional large random scaling to stats.
+        # Mechanically:
+        #   hp0    *= (1 + U(0.5, 2.0))
+        #   atk0   *= (1 + U(0.5, 2.0))
+        #   vision0 = int(vision0 * (1 + U(0.5, 2.0)))
+        #
+        # Note: random.uniform(0.5, 2.0) returns value in [0.5, 2.0].
+        # Thus multiplier is in [1.5, 3.0].
         _respawn_counter += 1
         if _respawn_counter % 1000 == 0:
             hp0 *= (1.0 + random.uniform(0.5, 2.0))
             atk0 *= (1.0 + random.uniform(0.5, 2.0))
             vision0 = int(vision0 * (1.0 + random.uniform(0.5, 2.0)))
-            print(f"** Rare Mutation on slot {slot} (team {'red' if team_id==TEAM_RED_ID else 'blue'})! "
-                  f"HP:{hp0:.2f}, ATK:{atk0:.2f}, VIS:{vision0} **")
+            print(
+                f"** Rare Mutation on slot {slot} (team {'red' if team_id==TEAM_RED_ID else 'blue'})! "
+                f"HP:{hp0:.2f}, ATK:{atk0:.2f}, VIS:{vision0} **"
+            )
 
-        # Decide whether to clone an existing parent or create a fresh brain
+        # Decide whether to clone an existing parent or create a fresh brain.
+        #
+        # use_clone is True only if:
+        #   - there exists at least one alive parent in this team (parents.numel() > 0)
+        #   - random coin flip < clone_prob
         use_clone = (parents.numel() > 0) and (random.random() < cfg.clone_prob)
-        pj = None  # B8: define pj here so it's accessible later for metadata
+
+        pj = None  # Parent slot index (only defined if cloning).
         if use_clone:
+            # Choose a random parent index from the parents list.
+            # random.randrange(n) returns integer in [0, n).
             pj = int(parents[random.randrange(parents.numel())].item())
+
+            # Clone the parent's brain, preserving architecture rules.
             brain = _clone_brain(reg.brains[pj], reg.device, team_id=team_id)
+
+            # Apply small Gaussian perturbation to weights for diversity.
             _perturb_brain_(brain, cfg.mutation_std)
         else:
+            # Create a brand-new brain using team-aware assignment rules.
             brain = _new_brain(reg.device, team_id=team_id)
 
-        # Write to registry
+        # Commit agent state into registry tensors and brain storage.
         _write_agent_to_registry(reg, slot, team_id, x, y, unit_id, hp0, atk0, vision0, brain)
 
-        # B8: Telemetry hook: capture spawn metadata without affecting simulation.
+        # Telemetry hook: capture spawn metadata without affecting simulation.
+        #
+        # meta_out is an optional list. If provided, append a dict describing spawn.
+        # This can be used by logging/telemetry systems to record births,
+        # evolutionary lineage, and spawn positions.
         if meta_out is not None:
-            # Read true UID from int64 side-tensor (never overflows/rounds).
+            # Read true UID from int64 side-tensor if present.
             if hasattr(reg, "agent_uids"):
                 child_aid = int(reg.agent_uids[slot].item())
                 parent_aid = int(reg.agent_uids[pj].item()) if use_clone else None
@@ -451,6 +957,7 @@ def _respawn_some(
                 # Fallback for older registries (may be unsafe under float16).
                 child_aid = int(reg.agent_data[slot, COL_AGENT_ID].item())
                 parent_aid = int(reg.agent_data[pj, COL_AGENT_ID].item()) if use_clone else None
+
             meta_out.append({
                 "tick": int(tick),
                 "slot": int(slot),
@@ -465,10 +972,16 @@ def _respawn_some(
                 "mutation_std": float(cfg.mutation_std),
             })
 
-        # Update grid (MUST MATCH spawn.py + raycast contract):
-        #   grid[0]: occupancy (0 empty, 1 wall, 2 red, 3 blue)
+        # Update grid to reflect the spawned agent.
+        #
+        # IMPORTANT CONTRACT (as stated in comment):
+        #   grid[0]: occupancy code
         #   grid[1]: hp
-        #   grid[2]: slot id (agent index), -1 for empty
+        #   grid[2]: slot index (-1 for empty)
+        #
+        # Here occupancy is set to float(team_id), which implies TEAM_RED_ID and
+        # TEAM_BLUE_ID are chosen to match the occupancy encoding for teams
+        # (commonly 2.0 and 3.0).
         grid[0, y, x] = float(team_id)
         grid[1, y, x] = float(hp0)
         grid[2, y, x] = float(slot)
@@ -479,27 +992,71 @@ def _respawn_some(
 
 
 # ----------------------------------------------------------------------
-# RespawnController: advanced team‑aware respawn logic
+# RespawnController: advanced team-aware respawn logic
 # ----------------------------------------------------------------------
 class RespawnController:
-    """Controller that manages floor‑based and periodic respawning."""
+    """Controller that manages floor-based and periodic respawning.
+
+    RESPONSIBILITIES
+    ----------------
+    The controller enforces two respawn mechanisms:
+
+      1) Floor-based respawn:
+         - If alive count for a team is below cfg.floor_per_team,
+           spawn enough agents to move toward the floor, subject to:
+             - cfg.max_per_tick cap
+             - cfg.cooldown_ticks hysteresis
+
+      2) Periodic respawn:
+         - Every cfg.period_ticks ticks,
+           distribute cfg.period_budget respawns across teams based on inverse
+           proportional split of current alive counts.
+
+    TELEMETRY
+    ---------
+    last_spawn_meta is filled during each step() call with per-agent metadata,
+    enabling external logging without mutating simulation logic further.
+    """
 
     def __init__(self, cfg: RespawnCfg):
         self.cfg = cfg
+
+        # Cooldown boundaries: when floor-based spawns are allowed again.
         self._cooldown_red_until = 0
         self._cooldown_blue_until = 0
+
+        # Tracks last tick when periodic budget was distributed.
         self._last_period_tick = 0
-        # B3: Filled each step() with metadata for newly spawned agents (for telemetry).
+
+        # Per-step metadata for all spawns performed in the most recent step.
         self.last_spawn_meta: List[Dict[str, object]] = []
 
     def step(self, tick: int, reg: AgentsRegistry, grid: torch.Tensor) -> Tuple[int, int]:
         """
         Execute one step of the respawn logic.
 
-        Returns:
-            Tuple (spawned_red, spawned_blue) with the numbers of agents spawned this tick.
+        PARAMETERS
+        ----------
+        tick: int
+          Current simulation tick.
+        reg: AgentsRegistry
+          Registry containing agent states and brains.
+        grid: torch.Tensor
+          Grid tensor to update occupancy/hp/slot-id for spawned agents.
+
+        RETURNS
+        -------
+        (spawned_red, spawned_blue): Tuple[int, int]
+          Number of agents spawned for each team during this tick.
+
+        IMPORTANT STATEFUL BEHAVIOR
+        ---------------------------
+        This method uses internal controller state:
+          - cooldown thresholds
+          - last periodic tick
+          - last_spawn_meta (reset per step)
         """
-        # B4: reset per-step spawn metadata
+        # Reset per-step metadata.
         self.last_spawn_meta = []
 
         if not self.cfg.enabled:
@@ -508,32 +1065,69 @@ class RespawnController:
         counts = _team_counts(reg)
         spawned_r = spawned_b = 0
 
-        # Floor‑based respawn (with cooldown)
+        # ------------------------------------------------------------------
+        # 1) FLOOR-BASED RESPAWN WITH COOLDOWN (HYSTERESIS)
+        # ------------------------------------------------------------------
+        #
+        # If counts.red < floor and cooldown passed:
+        #   need = floor - counts.red
+        #   spawn = min(need, max_per_tick)
+        #   if we reach floor after spawning:
+        #       set cooldown to tick + cooldown_ticks
+        #
+        # This hysteresis prevents repeated firing due to small fluctuations.
         if counts.red < self.cfg.floor_per_team and tick >= self._cooldown_red_until:
             need = self.cfg.floor_per_team - counts.red
-            # B6: pass tick and meta_out
-            spawned = _respawn_some(reg, grid, TEAM_RED_ID, _cap(need, self.cfg), self.cfg, tick, self.last_spawn_meta)
+            spawned = _respawn_some(
+                reg, grid, TEAM_RED_ID,
+                _cap(need, self.cfg),
+                self.cfg,
+                tick,
+                self.last_spawn_meta
+            )
             spawned_r += spawned
             if counts.red + spawned >= self.cfg.floor_per_team:
                 self._cooldown_red_until = tick + self.cfg.cooldown_ticks
 
         if counts.blue < self.cfg.floor_per_team and tick >= self._cooldown_blue_until:
             need = self.cfg.floor_per_team - counts.blue
-            # B6: pass tick and meta_out
-            spawned = _respawn_some(reg, grid, TEAM_BLUE_ID, _cap(need, self.cfg), self.cfg, tick, self.last_spawn_meta)
+            spawned = _respawn_some(
+                reg, grid, TEAM_BLUE_ID,
+                _cap(need, self.cfg),
+                self.cfg,
+                tick,
+                self.last_spawn_meta
+            )
             spawned_b += spawned
             if counts.blue + spawned >= self.cfg.floor_per_team:
                 self._cooldown_blue_until = tick + self.cfg.cooldown_ticks
 
-        # Periodic respawn (inverse proportional to current team sizes)
+        # ------------------------------------------------------------------
+        # 2) PERIODIC RESPAWN BUDGET (INVERSE SPLIT)
+        # ------------------------------------------------------------------
+        #
+        # Every period_ticks, allocate period_budget respawns.
+        # Distribution is based on inverse of alive counts, so smaller team
+        # receives a larger share.
         if tick - self._last_period_tick >= self.cfg.period_ticks:
             self._last_period_tick = tick
             total_alive = counts.red + counts.blue
             if total_alive > 0:
                 q_r, q_b = _inverse_split(counts.red, counts.blue, self.cfg.period_budget)
-                # B6: pass tick and meta_out for both calls
-                spawned_r += _respawn_some(reg, grid, TEAM_RED_ID, _cap(q_r, self.cfg), self.cfg, tick, self.last_spawn_meta)
-                spawned_b += _respawn_some(reg, grid, TEAM_BLUE_ID, _cap(q_b, self.cfg), self.cfg, tick, self.last_spawn_meta)
+                spawned_r += _respawn_some(
+                    reg, grid, TEAM_RED_ID,
+                    _cap(q_r, self.cfg),
+                    self.cfg,
+                    tick,
+                    self.last_spawn_meta
+                )
+                spawned_b += _respawn_some(
+                    reg, grid, TEAM_BLUE_ID,
+                    _cap(q_b, self.cfg),
+                    self.cfg,
+                    tick,
+                    self.last_spawn_meta
+                )
 
         return spawned_r, spawned_b
 
@@ -545,11 +1139,35 @@ def respawn_tick(reg: AgentsRegistry, grid: torch.Tensor, cfg: RespawnCfg) -> No
     """
     Perform one tick of respawning.
 
-    This function maintains the original signature. It creates a temporary
-    RespawnController and runs its step. The old probabilistic fields
-    (prob_per_dead_per_tick) are ignored; the new controller uses the
-    floor/period logic defined in the extended RespawnCfg.
+    BACKWARD COMPATIBILITY NOTE
+    ---------------------------
+    This function preserves the old signature:
+      respawn_tick(reg, grid, cfg)
+
+    However, it constructs a *new* RespawnController each call and invokes step
+    with tick=0.
+
+    IMPLICATIONS OF CONSTRUCTING A NEW CONTROLLER EACH CALL
+    ------------------------------------------------------
+    Because the controller is re-created:
+      - cooldown state is reset every call,
+      - _last_period_tick is reset every call,
+      - periodic and hysteresis behavior will not behave as intended if you call
+        respawn_tick repeatedly expecting statefulness.
+
+    In other words, this wrapper is suitable for "one-off" respawn operations
+    or compatibility stubs, but not for long-running tick-by-tick control unless
+    it is replaced by a persistent controller instance elsewhere in the engine.
+
+    LEGACY FIELDS
+    -------------
+    prob_per_dead_per_tick is explicitly ignored, as the new controller does not
+    implement probabilistic respawn in this path.
+
+    RETURN VALUE
+    ------------
+    None. step() returns counts, but they are ignored to match the old API.
     """
     controller = RespawnController(cfg)
-    controller.step(0, reg, grid)  # tick number is not critical for one‑off calls
+    controller.step(0, reg, grid)  # tick number is not critical for one-off calls
     # Note: step returns counts, but we ignore them to match old API.
