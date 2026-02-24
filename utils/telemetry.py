@@ -54,7 +54,7 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple  # Tuple imported but may be used elsewhere.
+from typing import Any, Dict, List, Optional, Tuple  # Tuple is used for buffered counter rows.
 import config
 
 
@@ -226,7 +226,7 @@ class TelemetrySession:
         # ---------------------------------------------------------------------
         # Schema versioning (important for downstream analysis compatibility)
         # ---------------------------------------------------------------------
-        # NOTE: The original code sets schema_version as int here...
+        # NOTE: The original code sets schema_version as int here.
         self.schema_version: int = int(getattr(config, "TELEMETRY_SCHEMA_VERSION", 2))
 
         # ---------------------------------------------------------------------
@@ -246,6 +246,30 @@ class TelemetrySession:
         self.log_damage: bool = bool(getattr(config, "TELEMETRY_LOG_DAMAGE", True))
         self.log_kills: bool = bool(getattr(config, "TELEMETRY_LOG_KILLS", True))
         self.damage_mode: str = str(getattr(config, "TELEMETRY_DAMAGE_MODE", "victim_sum"))
+
+        # ---------------------------------------------------------------------
+        # Movement telemetry (aggregates are cheap; per-agent events are optional)
+        # ---------------------------------------------------------------------
+        # NOTE: config already defines TELEMETRY_LOG_MOVES (FWS_TELEM_MOVES).
+        # We interpret it as enabling movement telemetry in general:
+        #   - always write cheap aggregates (move_summary.csv)
+        #   - optionally emit sampled per-agent 'move' events (events_*.jsonl)
+        self.log_moves: bool = bool(getattr(config, "TELEMETRY_LOG_MOVES", False))
+
+        # Per-agent move event sampling knobs:
+        #   - move_events_every: 0 disables per-agent move events (aggregates still work)
+        #   - move_events_max_per_tick: hard cap to prevent event explosions
+        #   - move_events_sample_rate: deterministic sampler (0..1)
+        self.move_events_every: int = int(getattr(config, "TELEMETRY_MOVE_EVENTS_EVERY", 0))
+        self.move_events_max_per_tick: int = int(getattr(config, "TELEMETRY_MOVE_EVENTS_MAX_PER_TICK", 256))
+        self.move_events_sample_rate: float = float(getattr(config, "TELEMETRY_MOVE_EVENTS_SAMPLE_RATE", 1.0))
+
+        # ---------------------------------------------------------------------
+        # Generic "counters" stream for lightweight extensions
+        # ---------------------------------------------------------------------
+        # Emits rows to counters.csv in long format: (tick, key, value).
+        # This is intentionally schema-stable: adding new keys does not change the file schema.
+        self.counters_every: int = int(getattr(config, "TELEMETRY_COUNTERS_EVERY", 0))
 
         # ---------------------------------------------------------------------
         # Validation knobs (detect internal inconsistencies)
@@ -269,6 +293,10 @@ class TelemetrySession:
         self.run_meta_path = self.telemetry_dir / "run_meta.json"
         self.agent_static_path = self.telemetry_dir / "agent_static.csv"
         self.tick_summary_path = self.telemetry_dir / "tick_summary.csv"
+
+        # Movement aggregates (cheap) + generic extension counters (long format)
+        self.move_summary_path = self.telemetry_dir / "move_summary.csv"
+        self.counters_path = self.telemetry_dir / "counters.csv"
 
         # Create directories (safe even if they already exist).
         self.telemetry_dir.mkdir(parents=True, exist_ok=True)
@@ -301,6 +329,12 @@ class TelemetrySession:
         # ---------------------------------------------------------------------
         self._registry: Any = None
         self._stats: Any = None
+
+        # ---------------------------------------------------------------------
+        # Buffered side-streams (flushed on the same cadence as event chunks)
+        # ---------------------------------------------------------------------
+        self._move_agg_buf: List[Dict[str, Any]] = []
+        self._counters_buf: List[Tuple[int, str, float]] = []
 
         # ---------------------------------------------------------------------
         # AgentStatic deduplication: track which agent_ids already written
@@ -656,6 +690,171 @@ class TelemetrySession:
             w.writerow(r)
 
         _atomic_write_text(self.agent_life_path, buf.getvalue())
+
+    def _flush_move_summary(self) -> None:
+        """Flush buffered movement aggregate rows to move_summary.csv."""
+        if not self.enabled or not self._move_agg_buf:
+            return
+        fieldnames = [
+            "tick",
+            "attempted",
+            "can_move",
+            "moved",
+            "blocked_wall",
+            "blocked_occupied",
+            "conflict_lost",
+            "conflict_tie",
+        ]
+        self._append_csv_rows(self.move_summary_path, fieldnames=fieldnames, rows=self._move_agg_buf)
+        self._move_agg_buf.clear()
+
+    def _flush_counters(self) -> None:
+        """Flush buffered (tick, key, value) tuples to counters.csv."""
+        if not self.enabled or not self._counters_buf:
+            return
+        rows: List[Dict[str, Any]] = [
+            {"tick": int(t), "key": str(k), "value": float(v)} for (t, k, v) in self._counters_buf
+        ]
+        self._append_csv_rows(self.counters_path, fieldnames=["tick", "key", "value"], rows=rows)
+        self._counters_buf.clear()
+
+    # =============================================================================
+    # Movement telemetry (aggregates + optional per-agent events)
+    # =============================================================================
+
+    def record_move_summary(
+        self,
+        tick: int,
+        attempted: int,
+        can_move: int,
+        moved: int,
+        blocked_wall: int,
+        blocked_occupied: int,
+        conflict_lost: int,
+        conflict_tie: int,
+    ) -> None:
+        """
+        Record cheap per-tick movement aggregates.
+
+        Output:
+          telemetry/move_summary.csv (append)
+        """
+        if not self.enabled or not self.log_moves:
+            return
+
+        self._move_agg_buf.append({
+            "tick": int(tick),
+            "attempted": int(attempted),
+            "can_move": int(can_move),
+            "moved": int(moved),
+            "blocked_wall": int(blocked_wall),
+            "blocked_occupied": int(blocked_occupied),
+            "conflict_lost": int(conflict_lost),
+            "conflict_tie": int(conflict_tie),
+        })
+
+        # Safety valve: if buffer grows very large (misconfig), flush immediately.
+        if len(self._move_agg_buf) >= max(1, int(self.event_chunk_size)):
+            self._flush_move_summary()
+
+    def record_move_events(
+        self,
+        tick: int,
+        agent_ids: List[int],
+        actions: List[int],
+        from_x: List[int],
+        from_y: List[int],
+        to_x: List[int],
+        to_y: List[int],
+        outcome_code: List[int],
+    ) -> None:
+        """
+        Record sampled per-agent move events into the main events stream.
+
+        Event schema (type="move")
+        -------------------------
+          - tick, agent_id, action
+          - from_x, from_y, to_x, to_y
+          - outcome: one of:
+              "success" | "blocked_wall" | "blocked_occupied" | "conflict_lost" | "conflict_tie"
+
+        Important:
+        ----------
+        This method expects inputs already sampled/capped by the engine to keep overhead minimal.
+        """
+        if not self.enabled or not self.log_moves:
+            return
+
+        # If per-agent move events are disabled, treat as no-op (aggregates still work).
+        if int(getattr(self, "move_events_every", 0)) <= 0:
+            return
+
+        # Defensive: align lengths to shortest.
+        n = min(
+            len(agent_ids),
+            len(actions),
+            len(from_x),
+            len(from_y),
+            len(to_x),
+            len(to_y),
+            len(outcome_code),
+        )
+
+        def _outcome_str(code: int) -> str:
+            c = int(code)
+            if c == 0:
+                return "success"
+            if c == 1:
+                return "blocked_wall"
+            if c == 2:
+                return "blocked_occupied"
+            if c == 3:
+                return "conflict_lost"
+            if c == 4:
+                return "conflict_tie"
+            return "unknown"
+
+        for i in range(n):
+            self._require_birth(int(agent_ids[i]), "move")
+            self._emit_event({
+                "schema_version": int(getattr(self, "schema_version", 2)),
+                "tick": int(tick),
+                "type": "move",
+                "agent_id": int(agent_ids[i]),
+                "action": int(actions[i]),
+                "from_x": int(from_x[i]),
+                "from_y": int(from_y[i]),
+                "to_x": int(to_x[i]),
+                "to_y": int(to_y[i]),
+                "outcome": _outcome_str(outcome_code[i]),
+            })
+
+    # =============================================================================
+    # Generic counters stream (lightweight extension point)
+    # =============================================================================
+
+    def emit_counters(self, tick: int, counters: Dict[str, float]) -> None:
+        """
+        Emit lightweight per-tick counters in long format to telemetry/counters.csv.
+
+        Format:
+          tick,key,value
+
+        This is an intentionally schema-stable extension point:
+        you can add new counter keys without changing the file schema.
+        """
+        if not self.enabled:
+            return
+
+        every = int(getattr(self, "counters_every", 0))
+        if every <= 0 or (int(tick) % every) != 0:
+            return
+
+        for k, v in counters.items():
+            self._counters_buf.append((int(tick), str(k), float(v)))
+
+        if len(self._counters_buf) >= max(1, int(self.event_chunk_size)):
+            self._flush_counters()
 
     def validate(self) -> None:
         """
@@ -1354,6 +1553,8 @@ class TelemetrySession:
         if self.flush_every > 0 and (int(tick) % int(self.flush_every) == 0):
             self._flush_agent_life_snapshot()
             self._flush_event_chunk()
+            self._flush_move_summary()
+            self._flush_counters()
 
         if self.tick_summary_every > 0 and (tick % int(self.tick_summary_every)) == 0:
             self._write_tick_summary(tick=int(tick))
@@ -1458,6 +1659,8 @@ class TelemetrySession:
         try:
             self._flush_event_chunk()
             self._flush_agent_life_snapshot()
+            self._flush_move_summary()
+            self._flush_counters()
             if self._last_tick_seen is not None and self.tick_summary_every > 0:
                 self._write_tick_summary(tick=self._last_tick_seen)
         except Exception as e:

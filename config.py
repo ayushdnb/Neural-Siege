@@ -249,6 +249,15 @@ TELEMETRY_LOG_KILLS: bool = _env_bool("FWS_TELEM_KILLS", True)
 TELEMETRY_LOG_MOVES: bool = _env_bool("FWS_TELEM_MOVES", True)   # can be huge
 TELEMETRY_LOG_PPO: bool = _env_bool("FWS_TELEM_PPO", True)
 
+# Move event sampling (used when TELEMETRY_LOG_MOVES is enabled).
+# Aggregates are always cheap; per-agent move events are gated by *_EVERY and capped by *_MAX.
+TELEMETRY_MOVE_EVENTS_EVERY: int = _env_int("FWS_TELEM_MOVE_EVERY", 0)        # 0=off (aggregates only)
+TELEMETRY_MOVE_EVENTS_MAX_PER_TICK: int = _env_int("FWS_TELEM_MOVE_MAX", 256) # hard cap
+TELEMETRY_MOVE_EVENTS_SAMPLE_RATE: float = _env_float("FWS_TELEM_MOVE_RATE", 1.0)  # 0..1, deterministic sampler
+
+# Generic extension counters stream (tick,key,value) in telemetry/counters.csv
+TELEMETRY_COUNTERS_EVERY: int = _env_int("FWS_TELEM_COUNTERS_EVERY", 0)       # 0=off
+
 # Damage logging mode:
 # - "victim_sum": one row per victim per tick (smaller)
 # - "per_hit": one row per attacker->victim (bigger)

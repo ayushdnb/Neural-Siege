@@ -49,7 +49,6 @@
 #
 # =============================================================================
 
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -57,14 +56,14 @@ import collections
 import os
 from typing import Dict, Optional, List, Tuple, TYPE_CHECKING
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # PyTorch is used for tensor math and GPU acceleration.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 import torch
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Project imports (simulation config + engine subsystems)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 import config
 from simulation.stats import SimulationStats
 from engine.agent_registry import (
@@ -79,18 +78,18 @@ from engine.mapgen import Zones
 from agent.ensemble import ensemble_forward
 from agent.transformer_brain import TransformerBrain  # (Imported, may be used elsewhere / kept as-is)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # TYPE_CHECKING is True only for static analysis / IDE type checking.
 # This avoids runtime circular imports while still enabling autocomplete.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 if TYPE_CHECKING:
     from rl.ppo_runtime import PerAgentPPORuntime
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Optional PPO runtime import:
 # The PPO runtime might not exist / might fail to import in some deployments.
 # In that case, PPO is disabled at runtime.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 try:
     from rl.ppo_runtime import PerAgentPPORuntime as _PerAgentPPORuntimeRT
 except Exception:
@@ -107,6 +106,11 @@ except Exception:
 #   - comparisons (optional)
 #
 # Here it is used as a simple “struct” to track what happened in one tick.
+#
+# NOTE ABOUT DESIGN:
+# - These are cheap scalar aggregates (Python ints/floats) updated once per tick.
+# - They are meant for printing/logging/telemetry dashboards, not for training.
+# - Keeping them minimal avoids overhead in the hot loop.
 # =============================================================================
 @dataclass
 class TickMetrics:
@@ -118,6 +122,14 @@ class TickMetrics:
     tick: int = 0
     cp_red_tick: float = 0.0
     cp_blue_tick: float = 0.0
+
+    # Movement (cheap aggregates; see telemetry/move_summary.csv)
+    move_attempted: int = 0
+    move_can_move: int = 0
+    move_blocked_wall: int = 0
+    move_blocked_occupied: int = 0
+    move_conflict_lost: int = 0
+    move_conflict_tie: int = 0
 
 
 # =============================================================================
@@ -1179,16 +1191,60 @@ class TickEngine:
 
         # Movement actions are 1..8 (directional).
         is_move = alive_after & (actions >= 1) & (actions <= 8)
-        if is_move.any():
-            move_idx, dir_idx = alive_idx[is_move], actions[is_move] - 1
-            x0, y0 = pos_xy[is_move].T
-            nx = (x0 + self.DIRS8_dev[dir_idx, 0]).clamp(0, self.W - 1)
-            ny = (y0 + self.DIRS8_dev[dir_idx, 1]).clamp(0, self.H - 1)
 
-            # Destination must be empty:
-            can_move = (self.grid[0][ny, nx] == self._g0)
-            if can_move.any():
-                move_idx, x0, y0, nx, ny = move_idx[can_move], x0[can_move], y0[can_move], nx[can_move], ny[can_move]
+        # Movement aggregates (kept cheap; used for telemetry + debug)
+        metrics.move_attempted = 0
+        metrics.move_can_move = 0
+        metrics.move_blocked_wall = 0
+        metrics.move_blocked_occupied = 0
+        metrics.move_conflict_lost = 0
+        metrics.move_conflict_tie = 0
+
+        if is_move.any():
+            # -----------------------------------------------------------------
+            # 6.1) Compute intended destinations for ALL attempted moves
+            # -----------------------------------------------------------------
+            move_idx_all = alive_idx[is_move]
+            a_all = actions[is_move]               # chosen action code (1..8)
+            dir_idx = a_all - 1                    # 0..7
+
+            x0_all, y0_all = pos_xy[is_move].T
+            nx_all = (x0_all + self.DIRS8_dev[dir_idx, 0]).clamp(0, self.W - 1)
+            ny_all = (y0_all + self.DIRS8_dev[dir_idx, 1]).clamp(0, self.H - 1)
+
+            metrics.move_attempted = int(move_idx_all.numel())
+
+            # Destination occupancy code (grid channel 0):
+            #   0.0 empty | 1.0 wall | 2.0 red | 3.0 blue
+            occ_all = self.grid[0][ny_all, nx_all]
+            g_wall = (self._g0 + 1.0)
+
+            # Destination must be empty to be eligible for movement
+            can_move_all = (occ_all == self._g0)
+            metrics.move_can_move = int(move_idx_all[can_move_all].numel())
+
+            # Blocked outcomes (attempted but destination not empty)
+            blocked_all = ~can_move_all
+            if blocked_all.any():
+                occ_blocked = occ_all[blocked_all]
+                blocked_wall = (occ_blocked == g_wall)
+                # NOTE: anything that's not wall and not empty is treated as "occupied"
+                metrics.move_blocked_wall = int(blocked_wall.sum().item())
+                metrics.move_blocked_occupied = int((~blocked_wall).sum().item())
+
+            # These masks exist only for the can-move subset; set defaults for telemetry
+            winner_mask = torch.empty((0,), device=self.device, dtype=torch.bool)
+            tie_mask = torch.empty((0,), device=self.device, dtype=torch.bool)
+            lost_mask = torch.empty((0,), device=self.device, dtype=torch.bool)
+            can_locs = torch.empty((0,), device=self.device, dtype=torch.long)
+
+            # -----------------------------------------------------------------
+            # 6.2) Resolve moves among those whose destination is empty
+            # -----------------------------------------------------------------
+            if can_move_all.any():
+                move_idx = move_idx_all[can_move_all]
+                x0, y0, nx, ny = x0_all[can_move_all], y0_all[can_move_all], nx_all[can_move_all], ny_all[can_move_all]
+                can_locs = can_move_all.nonzero(as_tuple=False).squeeze(1)
 
                 # Conflict resolution:
                 # If multiple agents target same destination:
@@ -1197,9 +1253,12 @@ class TickEngine:
                 dest_key = (ny * self.W + nx).to(torch.long)  # unique cell id
                 hp = data[move_idx, COL_HP]                   # hp used to decide winners
 
-                try:
-                    num_cells = self.H * self.W
+                # Per-destination claimant count (works even if scatter_reduce_ is unavailable)
+                num_cells = int(self.H * self.W)
+                claim_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                claim_cnt.scatter_add_(0, dest_key, torch.ones_like(dest_key, dtype=torch.int32))
 
+                try:
                     # scatter_reduce_ (amax) finds per-cell maximum HP among claimants.
                     max_hp = torch.full((num_cells,), torch.finfo(hp.dtype).min, device=self.device, dtype=hp.dtype)
                     max_hp.scatter_reduce_(0, dest_key, hp, reduce="amax", include_self=True)
@@ -1212,7 +1271,9 @@ class TickEngine:
                     winner_mask = is_max & (max_cnt[dest_key] == 1)
                 except Exception:
                     # Fallback path if scatter_reduce_ not available.
+                    # Keep behavior consistent with the original: unique max HP wins, ties -> nobody.
                     winner_mask = torch.zeros_like(dest_key, dtype=torch.bool)
+
                     order = torch.argsort(dest_key)
                     dest_s = dest_key[order]
                     hp_s = hp[order]
@@ -1228,6 +1289,19 @@ class TickEngine:
                             if (grp_hp == maxv).sum().item() == 1:
                                 win_off = (grp_hp == maxv).nonzero(as_tuple=False).squeeze(1).item() + s
                                 winner_mask[order[win_off]] = True
+
+                # Classify conflict outcomes (used for aggregates + optional per-agent move events)
+                win_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                win_cnt.scatter_add_(0, dest_key, winner_mask.to(torch.int32))
+
+                conflict_mask = (claim_cnt[dest_key] > 1)
+                tie_mask = conflict_mask & (win_cnt[dest_key] == 0)                       # tie at destination => nobody moves
+                lost_mask = conflict_mask & (win_cnt[dest_key] == 1) & (~winner_mask)     # unique winner exists, others lose
+
+                if tie_mask.any():
+                    metrics.move_conflict_tie = int(tie_mask.sum().item())
+                if lost_mask.any():
+                    metrics.move_conflict_lost = int(lost_mask.sum().item())
 
                 if winner_mask.any():
                     w_move_idx = move_idx[winner_mask]
@@ -1247,15 +1321,88 @@ class TickEngine:
                     # Count moved winners
                     metrics.moved = int(w_move_idx.numel())
 
-                    # Optional debug placeholder
-                    if os.getenv("FWS_DEBUG_MOVE", "0") in {"1", "true", "True"}:
-                        for i_slot in w_move_idx.tolist():
-                            pass
+            # -----------------------------------------------------------------
+            # 6.3) Telemetry: movement aggregates + optional per-agent events
+            # -----------------------------------------------------------------
+            if telemetry is not None and getattr(telemetry, "enabled", False) and bool(getattr(telemetry, "log_moves", False)):
+                # Aggregates are always cheap and always recorded when log_moves is enabled.
+                try:
+                    telemetry.record_move_summary(
+                        tick=tick_now,
+                        attempted=int(metrics.move_attempted),
+                        can_move=int(metrics.move_can_move),
+                        moved=int(metrics.moved),
+                        blocked_wall=int(metrics.move_blocked_wall),
+                        blocked_occupied=int(metrics.move_blocked_occupied),
+                        conflict_lost=int(metrics.move_conflict_lost),
+                        conflict_tie=int(metrics.move_conflict_tie),
+                    )
+                except Exception:
+                    pass
 
-        # NOTE: The next line is kept EXACTLY as given.
-        # It overwrites metrics.moved based on local variables in scope.
-        # This appears unusual, but per instruction: DO NOT CHANGE CODE.
-        metrics.moved = int(dead_slots.numel()) if 'keep_slots' in locals() else 0
+                # Per-agent move events are optional and sampling-based.
+                try:
+                    every = int(getattr(telemetry, "move_events_every", 0))
+                    max_ev = int(getattr(telemetry, "move_events_max_per_tick", 0))
+                    rate = float(getattr(telemetry, "move_events_sample_rate", 1.0))
+                    if every > 0 and max_ev > 0 and (tick_now % every) == 0 and rate > 0.0:
+                        # Outcome codes for attempted moves:
+                        # 0=success | 1=blocked_wall | 2=blocked_occupied | 3=conflict_lost | 4=conflict_tie
+                        n_all = int(move_idx_all.numel())
+                        out_code = torch.full((n_all,), 2, device=self.device, dtype=torch.int16)  # default: blocked_occupied
+
+                        # Blocked outcomes (attempted but destination not empty)
+                        out_code[blocked_all & (occ_all == g_wall)] = 1
+                        out_code[can_move_all] = 0  # provisional: can-move defaults to success
+
+                        # Override can-move outcomes with conflict results (if any)
+                        if can_locs.numel() > 0:
+                            if tie_mask.numel() > 0 and tie_mask.any():
+                                out_code[can_locs[tie_mask]] = 4
+                            if lost_mask.numel() > 0 and lost_mask.any():
+                                out_code[can_locs[lost_mask]] = 3
+                            if winner_mask.numel() > 0:
+                                weird = (~winner_mask) & (~tie_mask)
+                                if weird.any():
+                                    out_code[can_locs[weird]] = 3
+
+                        # Deterministic sampling (no RNG; stable across runs):
+                        # hash = (slot_id * 1103515245 + tick * 12345) mod 2^32
+                        sel = torch.arange(n_all, device=self.device, dtype=torch.long)
+                        if rate < 1.0:
+                            slot64 = move_idx_all.to(torch.int64)
+                            h = (slot64 * 1103515245 + int(tick_now) * 12345) & 0xFFFFFFFF
+                            thr = int(rate * 4294967296.0)
+                            sel = sel[h < thr]
+
+                        if sel.numel() > 0:
+                            sel = sel[:max_ev]  # cap volume (deterministic order)
+
+                            sel_slots = move_idx_all.index_select(0, sel)
+                            if hasattr(self.registry, "agent_uids"):
+                                agent_ids = self.registry.agent_uids.index_select(0, sel_slots).detach().cpu().to(torch.int64).tolist()
+                            else:
+                                agent_ids = data[sel_slots, COL_AGENT_ID].detach().cpu().to(torch.int64).tolist()
+
+                            act_ids = a_all.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+                            fx = x0_all.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+                            fy = y0_all.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+                            tx = nx_all.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+                            ty = ny_all.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+                            oc = out_code.index_select(0, sel).detach().cpu().to(torch.int64).tolist()
+
+                            telemetry.record_move_events(
+                                tick=tick_now,
+                                agent_ids=agent_ids,
+                                actions=act_ids,
+                                from_x=fx,
+                                from_y=fy,
+                                to_x=tx,
+                                to_y=ty,
+                                outcome_code=oc,
+                            )
+                except Exception:
+                    pass
 
         # ----- END MOVE HANDLING -----
         self._debug_invariants("post_move")

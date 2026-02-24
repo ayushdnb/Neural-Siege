@@ -128,15 +128,16 @@ def seed_everything(seed: int) -> None:
     # can vary between runs, affecting behavior.
     os.environ["PYTHONHASHSEED"] = str(seed)
 
+    # Python stdlib RNG (used by some utilities / fallback random calls).
     random.seed(seed)
 
-    # NumPy seeding
+    # NumPy seeding (used for array sampling, mapgen randomness, etc.)
     try:
         np.random.seed(seed)
     except Exception:
         pass
 
-    # PyTorch seeding
+    # PyTorch seeding (CPU)
     torch.manual_seed(seed)
 
     # CUDA seeding (only if GPU is present)
@@ -256,6 +257,12 @@ def _mkdir_p(p: Path) -> None:
     Create directory and parents, like `mkdir -p`.
 
     This is used to ensure run directories exist even after crashes.
+
+    Beginner note:
+    --------------
+    `mkdir(parents=True, exist_ok=True)` means:
+    - parents=True  → also create missing parent folders
+    - exist_ok=True → do NOT error if folder already exists
     """
     p.mkdir(parents=True, exist_ok=True)
 
@@ -364,6 +371,11 @@ class _SimpleRecorder:
         5) Write frame to video
 
         Technical detail: `.detach()` prevents autograd tracking; we are logging, not training.
+
+        Advanced note (why `.contiguous()`):
+        -----------------------------------
+        Some tensor views are non-contiguous (strided). Converting those to numpy
+        can fail or be slow. `.contiguous()` ensures a compact memory layout.
         """
         if not self.enabled:
             return
@@ -436,6 +448,16 @@ def _headless_loop(
     - periodic printing
     - optional profiling hooks
     - checkpoint triggers
+
+    Signal shutdown design (important)
+    ----------------------------------
+    In headless mode, Ctrl+C (SIGINT) can arrive "between ticks".
+    We do NOT want to begin a new tick after shutdown is requested.
+    Therefore we:
+    - check `engine.shutdown_requested["flag"]` at the top of each loop
+    - run exactly one tick
+    - flush minimal outputs for that tick
+    - check again and break if requested
     """
     # Lazy import: avoids importing profiler utilities unless needed.
     from utils.profiler import torch_profiler_ctx, nvidia_smi_summary
@@ -444,7 +466,17 @@ def _headless_loop(
     # Optional torch profiler context manager (enabled via config)
     with torch_profiler_ctx() as prof:
         try:
+            # -----------------------------------------------------------------
+            # PATCHED BLOCK:
+            # - replace ONLY while header + first lines
+            # - add shutdown check at bottom of loop
+            # -----------------------------------------------------------------
             while limit == 0 or stats.tick < limit:
+                # If a signal requested shutdown, do not start a new tick.
+                # `engine.shutdown_requested` is attached in main() after signal registration.
+                if getattr(engine, "shutdown_requested", {}).get("flag", False):
+                    break
+
                 # ------------------------------------------------------------
                 # 1) Advance the simulation by exactly one tick
                 # ------------------------------------------------------------
@@ -461,6 +493,13 @@ def _headless_loop(
                 deaths = stats.drain_dead_log()
                 if deaths:
                     rw.write_deaths(deaths)
+
+                # After completing this tick’s output work, exit if shutdown requested.
+                if getattr(engine, "shutdown_requested", {}).get("flag", False):
+                    break
+                # -----------------------------------------------------------------
+                # ... (keep existing code unchanged) ...
+                # -----------------------------------------------------------------
 
                 # ------------------------------------------------------------
                 # 4) Periodic sanity check
@@ -586,6 +625,14 @@ def main() -> None:
 
     This function is deliberately long because it's orchestration. The actual
     simulation logic should be inside engine/ and agent/ modules.
+
+    Advanced engineering note:
+    --------------------------
+    A "graceful shutdown" means:
+    - do not corrupt logs/checkpoints
+    - do not leave files half-written
+    - do not kill background writer mid-transaction
+    - still respond quickly to Ctrl+C by checking a shutdown flag between ticks
     """
     # PyTorch can use different matmul kernels; "high" may improve performance on some GPUs.
     torch.set_float32_matmul_precision("high")
@@ -780,6 +827,16 @@ def main() -> None:
             pass
 
     # ------------------------------------------------------------------
+    # PATCHED BLOCK:
+    # - after signal registration loop in main(), add engine attachment
+    # ------------------------------------------------------------------
+    # Expose shutdown flag to engine (headless loop + UI loop can poll it)
+    try:
+        engine.shutdown_requested = shutdown_requested
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
     # 9) Run loop (UI or headless)
     # ------------------------------------------------------------------
     start_ts = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -814,6 +871,15 @@ def main() -> None:
                 limit=config.TICK_LIMIT,
                 ckpt_mgr=ckpt_mgr,
             )
+
+        # ------------------------------------------------------------------
+        # PATCHED BLOCK:
+        # - after UI/headless run completes inside the try: block,
+        #   add conversion of flag to KeyboardInterrupt to reuse shutdown path
+        # ------------------------------------------------------------------
+        # If a signal requested shutdown, translate it into the existing KeyboardInterrupt path.
+        if shutdown_requested.get("flag", False):
+            raise KeyboardInterrupt
 
     except KeyboardInterrupt:
         print("\n[main] Interrupted — flushing logs…")
