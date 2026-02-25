@@ -1,256 +1,506 @@
 # Infinite War Simulation
 
-A tick-based, grid-world, two-team multi-agent simulation with per-agent neural policies and optional training/telemetry (see `Infinite_War_Simulation/main.py`).
+A formal, reproducible, and extensible multi-agent grid simulation framework for large-scale reinforcement-learning experiments, telemetry-driven analysis, and long-running headless execution.
 
-> **Status:** Research code. Several behaviors depend on config flags and environment variables (see `Infinite_War_Simulation/config.py`).
-
----
-
-## What this is (5 bullets)
-
-* **Discrete-time grid simulation**: the world advances in integer ticks; the engine owns the tick loop and mechanics (see `Infinite_War_Simulation/engine/tick.py`).
-* **Many independent agents**: each agent has its own row in a registry tensor + a unique `agent_id` (see `Infinite_War_Simulation/engine/agent_registry.py`).
-* **Two teams**: occupancy encodes walls and team cells; rendering shows team stats (see `Infinite_War_Simulation/engine/ray_engine/raycast_32.py`, `Infinite_War_Simulation/ui/viewer.py`).
-* **Neural “brains” per agent**: multiple architectures exist (TransformerBrain / TronBrain / MirrorBrain) and are run in buckets (optionally via `torch.func.vmap`) (see `Infinite_War_Simulation/agent/*.py`, `Infinite_War_Simulation/agent/ensemble.py`).
-* **Optional logging & telemetry**: results CSVs + run summary; optional scientific telemetry sidecars (agent life table, lineage edges, event jsonl, tick summaries) (see `Infinite_War_Simulation/utils/results_writer.py`, `Infinite_War_Simulation/utils/telemetry.py`).
+This project combines a vectorized simulation engine, per-agent policy models, optional per-agent PPO training, structured telemetry, checkpoint-based recovery, and an optional real-time viewer.
 
 ---
 
-## Quickstart
+## Table of Contents
 
-### Requirements
+* [Overview](#overview)
+* [System Architecture](#system-architecture)
+* [Simulation Tick Lifecycle](#simulation-tick-lifecycle)
+* [Core Design Principles](#core-design-principles)
+* [Repository Structure](#repository-structure)
+* [Policy / Brain Architectures](#policy--brain-architectures)
+* [Telemetry, Results, and Analysis Outputs](#telemetry-results-and-analysis-outputs)
+* [Checkpointing and Resume](#checkpointing-and-resume)
+* [Configuration Model](#configuration-model)
+* [Quick Start](#quick-start)
+* [Common Runtime Profiles](#common-runtime-profiles)
+* [Performance and Operational Notes](#performance-and-operational-notes)
+* [Known Constraints and Assumptions](#known-constraints-and-assumptions)
+* [Extensibility Guidance](#extensibility-guidance)
+* [License](#license)
 
-* Python: **Unknown (not found in code dump)**
-* Core runtime deps (imported):
+---
 
-  * `torch` (see `Infinite_War_Simulation/main.py`, `Infinite_War_Simulation/engine/tick.py`)
-  * `numpy` (see `Infinite_War_Simulation/main.py`)
-  * `pygame` / `pygame-ce` (UI) (see `Infinite_War_Simulation/ui/viewer.py`)
-* Optional:
+## Overview
 
-  * `opencv-python` for raw AVI recording (`cv2`) (see `_SimpleRecorder` in `Infinite_War_Simulation/main.py`)
+**Infinite War Simulation** is a grid-based, multi-agent simulation system designed for:
 
-### Install
+* high-throughput simulation on CPU/GPU (PyTorch tensor operations),
+* reinforcement-learning experimentation (including PPO runtime integration),
+* long-duration headless runs with structured telemetry,
+* reproducible experiments via checkpointing and deterministic seeding,
+* optional UI-based inspection and video capture workflows.
 
-If you do not have a requirements file, install the minimal set:
+The runtime is organized around a central **tick engine** that advances the simulation by one discrete step (tick), while coordinating agent observations, policy inference, combat/movement rules, statistics, telemetry, and optional training.
 
-```bash
-pip install torch numpy pygame-ce
-# optional
-pip install opencv-python
+---
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    A[main.py\nApplication Orchestrator] --> B[config.py\nCentral Configuration + Env Overrides]
+    A --> C[engine.tick.TickEngine\nCore Tick Loop]
+    A --> D[simulation.stats.SimulationStats]
+    A --> E[utils.persistence.ResultsWriter\nBackground Writer Process]
+    A --> F[utils.telemetry.TelemetrySession]
+    A --> G[utils.checkpointing.CheckpointManager]
+    A --> H[ui.viewer.Viewer\nOptional]
+    A --> I[recorder.video_writer / OpenCV\nOptional]
+
+    C --> J[engine.agent_registry\nStruct-of-Arrays Agent State]
+    C --> K[engine.mapgen / engine.grid]
+    C --> L[engine.spawn / engine.respawn]
+    C --> M[engine.ray_engine.*]
+    C --> N[agent.ensemble\nBatched Inference Dispatcher]
+    N --> O[TransformerBrain]
+    N --> P[TronBrain]
+    N --> Q[MirrorBrain]
+    C --> R[rl.ppo_runtime\nOptional Per-Agent PPO]
 ```
 
-### Run
+### High-level responsibilities
 
-From the folder that contains `Infinite_War_Simulation/`:
+* **`main.py`**: top-level orchestration (startup, run loop, UI/headless mode, telemetry, checkpoints, shutdown).
+* **`engine.tick.py`**: core tick execution with combat-first semantics and vectorized state updates.
+* **`engine.agent_registry.py`**: dense tensor-based agent storage (GPU-friendly layout).
+* **`agent/*`**: policy/value networks and batched inference utilities.
+* **`utils/telemetry.py`**: analysis-grade telemetry, lineage, event logs, and atomic file writes.
+* **`utils/persistence.py`**: non-blocking background writer process for run outputs.
+* **`utils/checkpointing.py`**: crash-safe, resumable checkpoints with RNG-state capture.
+
+---
+
+## Simulation Tick Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Main as main.py
+    participant Engine as TickEngine
+    participant Registry as AgentsRegistry
+    participant Policy as agent.ensemble / brains
+    participant Stats as SimulationStats
+    participant Telem as TelemetrySession
+    participant Writer as ResultsWriter
+    participant Ckpt as CheckpointManager
+
+    Main->>Engine: run_tick()
+    Engine->>Registry: read world/agent state
+    Engine->>Policy: build observations + infer actions/logits/values
+    Engine->>Engine: resolve combat (first)
+    Engine->>Engine: resolve movement / occupancy / zones / respawn
+    Engine->>Stats: update cumulative counters and scores
+    Engine->>Telem: record snapshots/events/lineage (config-gated)
+    Main->>Writer: enqueue per-tick summaries (non-blocking)
+    Main->>Ckpt: periodic / manual-trigger checkpoint checks
+```
+
+### Important semantic detail
+
+The engine uses **combat-first** semantics. If an agent is eliminated during combat in the current tick, it does **not** move later in the same tick. This is a deliberate rules choice and materially affects emergent behavior.
+
+---
+
+## Core Design Principles
+
+### 1) Vectorized simulation state
+
+The project is built around tensorized state updates (primarily via PyTorch) to minimize Python-loop overhead and support larger agent populations.
+
+### 2) Dual state consistency (critical invariant)
+
+World state exists in two synchronized forms:
+
+* **Agent registry** (per-agent truth: position, HP, team, alive status, etc.)
+* **Grid tensor** (spatial occupancy and fast lookup representation)
+
+Maintaining consistency between these representations is a central correctness requirement.
+
+### 3) Reproducibility and long-run safety
+
+The codebase includes explicit support for:
+
+* deterministic seeding (`FWS_SEED`),
+* structured telemetry for post-run analysis,
+* atomic checkpoint writes,
+* Windows-friendly process handling and graceful shutdown considerations.
+
+### 4) Config-first runtime control
+
+`config.py` is the primary runtime contract. Most operational and experimental parameters are exposed through environment variables (prefixed `FWS_`), enabling reproducible sweeps without source edits.
+
+---
+
+## Repository Structure
+
+```text
+Infinite_War_Simulation/
+├─ main.py                        # Application orchestrator (headless/UI runtime)
+├─ config.py                      # Central config + environment overrides
+├─ lineage_tree.py                # Post-run lineage visualization utility
+│
+├─ agent/
+│  ├─ __init__.py
+│  ├─ ensemble.py                 # Batched inference dispatcher (loop/vmap fallback)
+│  ├─ transformer_brain.py        # Transformer-based actor-critic baseline
+│  ├─ tron_brain.py               # Tokenized plan/ray fusion policy architecture
+│  ├─ mirror_brain.py             # Two-pass propose→reflect/edit actor-critic
+│  └─ obs_spec.py                 # Observation schema split + semantic token mapping
+│
+├─ engine/
+│  ├─ __init__.py
+│  ├─ tick.py                     # Core tick engine (combat, movement, zones, RL hooks)
+│  ├─ agent_registry.py           # GPU-friendly agent storage (SoA-like layout)
+│  ├─ grid.py                     # Grid/world representation utilities
+│  ├─ mapgen.py                   # Map and zone generation
+│  ├─ spawn.py                    # Agent spawning + brain assignment
+│  ├─ respawn.py                  # Respawn controller logic
+│  ├─ game/
+│  │  └─ move_mask.py             # Movement legality masks / direction logic
+│  └─ ray_engine/
+│     ├─ raycast_32.py
+│     ├─ raycast_64.py
+│     └─ raycast_firsthit.py
+│
+├─ rl/
+│  ├─ __init__.py
+│  └─ ppo_runtime.py              # Optional per-agent PPO runtime (no parameter sharing)
+│
+├─ simulation/
+│  └─ stats.py                    # Scoring / counters / death logs / reward-friendly deltas
+│
+├─ ui/
+│  ├─ __init__.py
+│  ├─ camera.py
+│  └─ viewer.py                   # Optional real-time viewer (Pygame)
+│
+├─ recorder/
+│  ├─ __init__.py
+│  ├─ recorder.py                 # Arrow/Parquet schema + run metadata helpers
+│  ├─ schemas.py
+│  └─ video_writer.py             # MP4-first (imageio) with PNG fallback
+│
+└─ utils/
+   ├─ checkpointing.py            # Save/load/resume runtime state
+   ├─ persistence.py              # Background writer process (Windows-friendly)
+   ├─ profiler.py                 # Runtime profiling helpers
+   ├─ sanitize.py                 # Data hygiene / serialization helpers
+   └─ telemetry.py                # Agent life, lineage, events, snapshots, validation
+```
+
+---
+
+## Policy / Brain Architectures
+
+The codebase includes multiple policy/value model implementations for experimentation.
+
+### `TransformerBrain`
+
+A transformer-style actor-critic network that treats ray features as a token sequence and combines them with a rich-state token for policy/value prediction.
+
+### `TronBrain`
+
+A tokenized architecture using structured observation partitioning (rays + semantic tokens + instinct + learned decision/memory tokens) with self-attention and fusion blocks.
+
+### `MirrorBrain`
+
+A two-pass actor-critic design:
+
+1. **Propose**: generate base logits/value.
+2. **Reflect/Edit**: generate a residual correction using an internal reflection token (including uncertainty summaries such as entropy/margin).
+
+This design supports experimentation with self-correction-style policies while preserving a stable baseline path.
+
+### `agent/ensemble.py` (batched inference adapter)
+
+Provides a reliability-first batching layer that:
+
+* supports a safe loop-based path,
+* optionally attempts a `torch.func` + `vmap` path for inference acceleration,
+* falls back safely when unsupported or incompatible.
+
+---
+
+## Telemetry, Results, and Analysis Outputs
+
+The project distinguishes between **lightweight run outputs** and **richer telemetry outputs**.
+
+### A. Results writer outputs (background process)
+
+The multiprocessing writer is designed to reduce disk I/O impact on the simulation loop.
+
+Typical outputs include:
+
+* `config.json`
+* `stats.csv` (per-tick summaries)
+* `dead_agents_log.csv` (batched death/kill rows)
+* model state metadata sidecar files (`<label>.state_meta.json`, when used)
+
+### B. Telemetry session outputs (analysis-focused)
+
+Telemetry is designed for long runs and offline analysis. It is append-friendly, chunked where appropriate, and uses atomic writes for safety.
+
+Typical telemetry layout:
+
+```text
+<run_dir>/telemetry/
+├─ agent_life.csv                 # Per-agent lifecycle snapshots (overwrite snapshot style)
+├─ lineage_edges.csv              # Parent→child lineage edges (append)
+├─ run_meta.json                  # Run metadata (config-gated)
+├─ agent_static.csv               # Static per-agent attributes (config-gated)
+├─ tick_summary.csv               # Low-frequency summaries (config-gated)
+├─ move_summary.csv               # Movement aggregates (if enabled)
+├─ counters.csv                   # Extension counters / long-format metrics (if enabled)
+└─ events/
+   ├─ events_000001.jsonl
+   ├─ events_000002.jsonl
+   └─ ...
+```
+
+### C. Lineage analysis utility
+
+`lineage_tree.py` can build a lineage time-tree visualization from telemetry CSVs and can emit `lineage_time_tree.html` (Plotly path) for large-tree inspection.
+
+---
+
+## Checkpointing and Resume
+
+Checkpointing is designed for long-running experiments and crash recovery.
+
+### Key properties
+
+* atomic writes (temporary file + replace),
+* CPU-serializable checkpoint storage for portability,
+* saved RNG states (Python / NumPy / PyTorch CPU/CUDA) to improve reproducibility,
+* versioned checkpoint format for future evolution.
+
+### Resume behavior
+
+When a checkpoint path is provided via configuration/environment, `main.py` enters **resume mode** and reconstructs world state (including grid/zones and runtime state) before continuing the simulation.
+
+### Manual trigger file
+
+A manual checkpoint can be triggered by creating the configured trigger file in the run directory (default filename: `checkpoint.now`).
+
+---
+
+## Configuration Model
+
+`config.py` functions as a **central configuration contract** with environment-variable overrides.
+
+### Configuration goals
+
+* one-file defaults for reproducibility,
+* script-friendly override mechanism (`FWS_*` environment variables),
+* stable interface dimensions (observation/action shapes) to preserve checkpoint compatibility,
+* profile-based overrides for macro-tuning.
+
+### Common environment variables (examples)
+
+| Category        | Variable                            | Purpose                                                     |
+| --------------- | ----------------------------------- | ----------------------------------------------------------- |
+| Runtime mode    | `FWS_UI`                            | Enable/disable the real-time viewer (`0` headless / `1` UI) |
+| Reproducibility | `FWS_SEED`                          | Deterministic seed for repeatable runs                      |
+| Device          | `FWS_CUDA`, `FWS_AMP`               | CUDA enablement and mixed precision behavior                |
+| Telemetry       | `FWS_TELEMETRY`                     | Master telemetry toggle                                     |
+| Logging cadence | `FWS_HEADLESS_PRINT_EVERY_TICKS`    | Reduce console overhead during long runs                    |
+| Checkpointing   | `FWS_CHECKPOINT_PATH`               | Resume from a checkpoint path                               |
+| Checkpointing   | `FWS_CHECKPOINT_EVERY_TICKS`        | Periodic checkpoint interval                                |
+| UI / recording  | `FWS_RECORD_VIDEO`, `FWS_VIDEO_FPS` | Optional frame/video output                                 |
+| RL              | `FWS_PPO_ENABLED`                   | Enable/disable PPO runtime                                  |
+| Brain selection | `FWS_BRAIN`                         | Select policy architecture (project-dependent values)       |
+
+> **Note**: The configuration surface is intentionally extensive. For repeatable experimentation, prefer storing run scripts (PowerShell/Bash) alongside results rather than editing defaults in `config.py` for each experiment.
+
+---
+
+## Quick Start
+
+## 1) Requirements
+
+### Core runtime
+
+* Python 3.x
+* PyTorch
+* NumPy
+
+### Optional components
+
+* `pygame` / `pygame-ce` (UI viewer)
+* `opencv-python` (optional video path in `main.py`)
+* `imageio` (video writer utility with MP4/PNG fallback behavior)
+* `plotly` (lineage HTML visualization utility)
+* `pyarrow` (Arrow/Parquet schema workflows in recorder utilities)
+
+> Install only the optional dependencies you plan to use.
+
+## 2) Run the simulation (headless, default config)
+
+### PowerShell (Windows)
+
+```powershell
+cd Infinite_War_Simulation
+python main.py
+```
+
+### Bash (Linux/macOS)
 
 ```bash
 cd Infinite_War_Simulation
 python main.py
 ```
 
-Headless (no UI) is controlled by config/env flags (see `Infinite_War_Simulation/config.py`, and the UI/headless switch in `Infinite_War_Simulation/main.py`).
+## 3) Run in headless mode explicitly (recommended for throughput)
 
-### Outputs
+### PowerShell
 
-A run creates a timestamped directory under `results/` (see `Infinite_War_Simulation/utils/results_writer.py`). Typical artifacts:
-
-* `results/sim_YYYY-MM-DD_HH-MM-SS/config.json` (config snapshot) (see `Infinite_War_Simulation/utils/results_writer.py`)
-* `results/sim_.../stats.csv` (per-tick rows) (see `Infinite_War_Simulation/utils/results_writer.py`, `Infinite_War_Simulation/simulation/stats.py`)
-* `results/sim_.../dead_agents_log.csv` (death rows) (see `Infinite_War_Simulation/utils/results_writer.py`, `Infinite_War_Simulation/simulation/stats.py`)
-* `results/sim_.../summary.json` (final status + duration + final scores) (see `Infinite_War_Simulation/main.py`)
-* `results/sim_.../crash_trace.txt` (only on crash) (see `Infinite_War_Simulation/main.py`)
-* `results/sim_.../simulation_raw.avi` (only if `RECORD_VIDEO` is enabled and `cv2` is installed) (see `_SimpleRecorder` in `Infinite_War_Simulation/main.py`)
-* `results/sim_.../telemetry/…` (only if telemetry enabled) (see `Infinite_War_Simulation/utils/telemetry.py`)
-
----
-
-## Core concepts (skim table)
-
-| Concept            | Meaning (short)                                                         | Where in code                                                                                                                                        |
-| ------------------ | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tick engine        | Owns the tick loop and applies all mechanics per tick                   | `Infinite_War_Simulation/engine/tick.py`                                                                                                             |
-| Grid tensor        | World state tensor; channel 0 is occupancy used by renderer/recorder    | `Infinite_War_Simulation/engine/grid.py`, `_SimpleRecorder` in `Infinite_War_Simulation/main.py`                                                     |
-| Agent registry     | Per-agent data stored in a tensor (hp, team, pos, etc.)                 | `Infinite_War_Simulation/engine/agent_registry.py`                                                                                                   |
-| Rays / perception  | Fast 32-ray first-hit raycast used to build observations                | `Infinite_War_Simulation/engine/ray_engine/raycast_32.py`                                                                                            |
-| Observation layout | Flat vector split into rays + rich_base + instinct; strict shape checks | `Infinite_War_Simulation/agent/obs_spec.py`, `Infinite_War_Simulation/config.py`                                                                     |
-| Action mask        | Valid action masking before sampling                                    | `Infinite_War_Simulation/engine/game/move_mask.py`                                                                                                   |
-| Brains             | Neural policies/values (TransformerBrain, TronBrain, MirrorBrain)       | `Infinite_War_Simulation/agent/transformer_brain.py`, `Infinite_War_Simulation/agent/tron_brain.py`, `Infinite_War_Simulation/agent/mirror_brain.py` |
-| Bucketed forward   | Groups agents by brain type; optional `torch.func.vmap` inference       | `Infinite_War_Simulation/agent/ensemble.py`, `Infinite_War_Simulation/engine/tick.py`                                                                |
-| PPO runtime        | Per-agent PPO buffers + update logic (if enabled)                       | `Infinite_War_Simulation/rl/ppo_runtime.py`                                                                                                          |
-| Stats              | Aggregates scores/kills/deaths/alive; provides CSV rows                 | `Infinite_War_Simulation/simulation/stats.py`                                                                                                        |
-| Checkpoints        | Save/load full world + runtime state                                    | `Infinite_War_Simulation/utils/checkpointing.py`, `Infinite_War_Simulation/main.py`                                                                  |
-| Results writer     | Background process writes CSVs + config.json                            | `Infinite_War_Simulation/utils/results_writer.py`                                                                                                    |
-| Telemetry          | Optional research-grade event logs + lineage tables                     | `Infinite_War_Simulation/utils/telemetry.py`                                                                                                         |
-| UI viewer          | Pygame loop + HUD (tick, speed, team stats)                             | `Infinite_War_Simulation/ui/viewer.py`                                                                                                               |
-
----
-
-## Architecture
-
-### Runtime pipeline (Mermaid)
-
-```mermaid
-flowchart TD
-  A["main.py build or load world"] --> B["TickEngine init"]
-  B --> C{"UI enabled?"}
-  C -->|yes| D["Viewer run loop"]
-  C -->|no| E["Headless loop"]
-  D --> F["TickEngine run_tick"]
-  E --> F
-
-  F --> G["Build observations rays and rich tail"]
-  G --> H["Build action mask"]
-  H --> I["Policy and value forward bucketed optional vmap"]
-  I --> J["Sample actions"]
-  J --> K["Resolve movement conflicts"]
-  K --> L["Combat damage and deaths"]
-  L --> M["Score and CP updates"]
-  M --> N["PPO record_step and optional updates"]
-  N --> O["Respawn step"]
-  O --> P["Telemetry hooks and periodic flush"]
-  P --> Q["Stats row written"]
+```powershell
+$env:FWS_UI = "0"
+python main.py
 ```
 
-> Note: each labeled stage above corresponds to explicit blocks and helpers inside `TickEngine.run_tick` and its collaborators (see `Infinite_War_Simulation/engine/tick.py`).
+### Bash
 
-### Module layout (ASCII)
-
+```bash
+export FWS_UI=0
+python main.py
 ```
-Infinite_War_Simulation/
-  main.py                 # entrypoint + run loops + results/telemetry setup
-  config.py               # env-driven configuration knobs
-  engine/                 # grid, registry, tick loop, raycast, spawn, mapgen
-  agent/                  # brain implementations + observation spec + inference bucketing
-  rl/                     # PPO runtime (per-agent)
-  simulation/             # stats + team score bookkeeping
-  ui/                     # pygame renderer/viewer
-  utils/                  # checkpointing, telemetry, background writers, profiling
+
+## 4) Enable telemetry explicitly
+
+### PowerShell
+
+```powershell
+$env:FWS_UI = "0"
+$env:FWS_TELEMETRY = "1"
+python main.py
+```
+
+### Bash
+
+```bash
+export FWS_UI=0
+export FWS_TELEMETRY=1
+python main.py
+```
+
+## 5) Resume from a checkpoint
+
+### PowerShell
+
+```powershell
+$env:FWS_CHECKPOINT_PATH = "C:\path\to\checkpoint.pt"
+python main.py
+```
+
+### Bash
+
+```bash
+export FWS_CHECKPOINT_PATH="/path/to/checkpoint.pt"
+python main.py
 ```
 
 ---
 
-## Determinism & reproducibility
+## Common Runtime Profiles
 
-* **Torch + NumPy seeding**: if `FWS_SEED` is set, the program seeds `torch` (CPU + CUDA) and `numpy` (see `_seed_all_from_env` in `Infinite_War_Simulation/main.py`).
-* **Other RNG sources**: the map/spawn code uses Python’s `random` module (see `Infinite_War_Simulation/engine/mapgen.py`, `Infinite_War_Simulation/engine/spawn.py`). Seeding for `random` is **Unknown (not found in main loop)**.
-* **Reproduce a run (best effort)**:
+### A. High-throughput headless analysis run
 
-  1. Set `FWS_SEED` to a fixed integer.
-  2. Keep the same device (`TORCH_DEVICE`) and config knobs.
-  3. Prefer headless mode for fewer timing effects.
+Use when the goal is long-duration simulation and post-run telemetry analysis:
 
-<details>
-<summary>Useful env/config knobs (selected)</summary>
+* `FWS_UI=0`
+* telemetry enabled (`FWS_TELEMETRY=1`)
+* lower console print frequency (e.g., larger `FWS_HEADLESS_PRINT_EVERY_TICKS`)
+* checkpoint interval configured for recovery safety
 
-| Knob                                   | What it changes                                           | Where                                                                            |
-| -------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `FWS_SEED`                             | Seeds `torch` + `numpy` in `main.py`                      | `Infinite_War_Simulation/main.py`                                                |
-| `FWS_TORCH_DEVICE`                     | Selects device string (`cuda` / `cpu`)                    | `Infinite_War_Simulation/config.py`                                              |
-| `FWS_START_AGENTS_PER_TEAM`            | Initial agents per team                                   | `Infinite_War_Simulation/config.py`, spawn in `Infinite_War_Simulation/main.py`  |
-| `FWS_SPAWN_MODE`                       | `uniform` vs `symmetric` spawning                         | `Infinite_War_Simulation/main.py`                                                |
-| `FWS_TICK_LIMIT`                       | Stop after N ticks (0 = infinite)                         | `Infinite_War_Simulation/config.py`, loop in `Infinite_War_Simulation/main.py`   |
-| `FWS_TARGET_FPS`                       | UI frame cap                                              | `Infinite_War_Simulation/config.py`, `Infinite_War_Simulation/ui/viewer.py`      |
-| `FWS_USE_VMAP` / `FWS_VMAP_MIN_BUCKET` | Enable/threshold `torch.func.vmap` inference              | `Infinite_War_Simulation/config.py`, `Infinite_War_Simulation/agent/ensemble.py` |
-| `FWS_AMP`                              | AMP autocast for brains (if implemented in tick/PPO path) | `Infinite_War_Simulation/config.py`, `Infinite_War_Simulation/engine/tick.py`    |
-| `FWS_CHECKPOINT_PATH`                  | Resume from checkpoint file                               | `Infinite_War_Simulation/config.py`, `Infinite_War_Simulation/main.py`           |
+### B. Interactive inspection run
 
-</details>
+Use when debugging visual behavior:
 
----
+* `FWS_UI=1`
+* telemetry optional (can be disabled for faster interactive iteration)
+* video recording disabled unless required
 
-## Telemetry / logs
+### C. RL experimentation run
 
-Telemetry is implemented as an additive, file-based sidecar inside the run folder (see `Infinite_War_Simulation/utils/telemetry.py`).
+Use when collecting PPO trajectories/training online:
 
-* Toggle: `TELEMETRY_ENABLED` is read from config (see `Infinite_War_Simulation/utils/telemetry.py`, `Infinite_War_Simulation/config.py`).
-* Output layout (inside `results/sim_.../telemetry/`):
-
-  * `agent_life.csv` (snapshot table)
-  * `lineage_edges.csv` (append-only parent→child edges)
-  * `tick_summary.csv` (per-tick aggregates)
-  * `agent_static.csv` + `run_meta.json` (optional sidecars)
-  * `events/events_00001.jsonl` (chunked append-only event log)
-
-<details>
-<summary>CSV schemas (as written in code)</summary>
-
-**`tick_summary.csv`** (see `Infinite_War_Simulation/utils/telemetry.py`):
-
-* `tick`, `red_alive`, `blue_alive`, `red_mean_hp`, `blue_mean_hp`, `red_kills`, `blue_kills`, `red_deaths`, `blue_deaths`, `red_dmg_dealt`, `blue_dmg_dealt`
-
-**`lineage_edges.csv`** (see `Infinite_War_Simulation/utils/telemetry.py`):
-
-* `tick`, `parent_id`, `child_id`
-
-**`agent_life.csv`** (see `Infinite_War_Simulation/utils/telemetry.py`):
-
-* `agent_id`, `slot_id`, `team`, `unit_type`, `born_tick`, `death_tick`, `parent_id`, `kills_total`, `damage_dealt_total`, `damage_taken_total`, `offspring_count`, `notes`
-
-</details>
-
-<details>
-<summary>Lineage visualization helper</summary>
-
-A standalone script exists to build a filtered lineage tree graph:
-
-* `lineage_tree.py` expects `lineage_edges.csv` and (optionally) `agent_life.csv` in the current working directory (see `lineage_tree.py`).
-* It can use Plotly if enabled in the script (`USE_PLOTLY = True`) (see `lineage_tree.py`).
-
-</details>
+* `FWS_PPO_ENABLED=1`
+* stable observation/action configuration
+* telemetry and checkpoints enabled
+* deterministic seeding for comparison runs
 
 ---
 
-## Screenshot
+## Performance and Operational Notes
 
-![Simulation UI](docs/sim.png)
+### Throughput-sensitive settings
 
-Caption (what is visible):
+* Console printing can become a measurable overhead during long runs.
+* Telemetry is I/O-bound; chunking and lower-frequency snapshots improve sustained throughput.
+* UI rendering and video recording are materially slower than headless mode.
 
-* A square grid world with many colored cells and several larger shaded green regions.
-* HUD shows: `Tick 12270 [ 0.25x ]` and two team lines (`Red … Alive:…`, `Blue … Alive:…`).
-* Team lines include fields like `S`, `CP`, `K`, `D`, and a split like `(S:…, A:…)` (see HUD formatting in `Infinite_War_Simulation/ui/viewer.py`).
+### Windows-specific notes
 
----
+The codebase includes explicit Windows-oriented handling for:
 
-## Minimal repo structure (from the code dump)
+* multiprocessing writer process behavior,
+* Ctrl+C shutdown robustness,
+* Intel Fortran runtime console-handler mitigation (to avoid abrupt termination in some numeric-stack environments).
 
-```text
-Infinite_War_Simulation/
-  main.py
-  config.py
-  agent/
-    ensemble.py
-    transformer_brain.py
-    tron_brain.py
-    mirror_brain.py
-    obs_spec.py
-  engine/
-    tick.py
-    agent_registry.py
-    grid.py
-    mapgen.py
-    spawn.py
-    respawn.py
-    ray_engine/raycast_32.py
-    game/move_mask.py
-  rl/ppo_runtime.py
-  simulation/stats.py
-  ui/viewer.py
-  utils/
-    results_writer.py
-    telemetry.py
-    checkpointing.py
-    profiler.py
-    sanitize.py
-```
+### Reliability-oriented choices in the codebase
+
+* background writer process to prevent logging stalls,
+* atomic writes in telemetry/checkpoint paths,
+* safe fallbacks in batched inference (`vmap` → loop),
+* strict shape/layout checks in observation and model interfaces.
 
 ---
 
-## Roadmap (safe)
+## Known Constraints and Assumptions
 
-* Document full environment-variable surface area (many knobs live in `Infinite_War_Simulation/config.py`).
-* Add a small “analysis/” notebook or scripts that parse `telemetry/events/*.jsonl` (event schema already versioned) (see `Infinite_War_Simulation/utils/telemetry.py`).
-* Optional gzip for event logs is flagged but not implemented (see `events_gzip` note in `Infinite_War_Simulation/utils/telemetry.py`).
-* Make seeding cover Python `random` for full map/spawn determinism (map/spawn use `random`; see `Infinite_War_Simulation/engine/mapgen.py`, `Infinite_War_Simulation/engine/spawn.py`).
-* Add a minimal `requirements.txt` / `pyproject.toml` (Unknown: not present in the code dump).
+The current codebase (as organized in this source set) assumes and/or emphasizes the following:
+
+* grid-based world semantics with discrete ticks,
+* strict observation layout contracts (shape changes can invalidate checkpoints/models),
+* optional components may require additional dependencies,
+* per-agent PPO mode uses **no parameter sharing**, which increases compute and memory cost but supports heterogeneous behavior.
+
+If you evolve the observation schema, action space, or checkpoint format, update documentation and migration logic together to preserve reproducibility.
+
+---
+
+## Extensibility Guidance
+
+This project is well-suited to incremental research and systems engineering extensions.
+
+### Typical extension directions
+
+* new brain architectures (maintain `(logits, value)` interface contract),
+* new telemetry channels (prefer config-gated, append-friendly outputs),
+* alternative reward shaping / scoring terms,
+* new map-generation regimes and objective placements,
+* offline analytics pipelines consuming `telemetry/events/*.jsonl` and CSV snapshots,
+* parameter-sharing or grouped-policy training variants (if desired for scale studies).
+
+### Practical guidance
+
+* Treat `config.py` and `agent/obs_spec.py` as interface contracts.
+* Preserve shape assertions and validation paths unless replacing them with stricter checks.
+* Prefer additive changes to telemetry and checkpoint schemas where possible.
+
+---
+
+## License
+
+MIT License
+
+Copyright (c) 2026 Ayush Kumar
+
+Permission is hereby granted, free of charge, to any person obtaining a copy...
+
