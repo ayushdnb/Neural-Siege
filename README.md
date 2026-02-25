@@ -1,4 +1,4 @@
-# Infinite War Simulation
+# Neural Siege
 
 A formal, reproducible, and extensible multi-agent grid simulation framework for large-scale reinforcement-learning experiments, telemetry-driven analysis, and long-running headless execution.
 
