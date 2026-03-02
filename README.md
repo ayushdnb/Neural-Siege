@@ -23,12 +23,12 @@ Neural Siege is a high-performance, grid-based multi-agent simulation framework 
 |---------|-------------|
 | **Tensor-Based Simulation** | Grid and agent state stored as PyTorch tensors; operations vectorized across all agents |
 | **Multi-Agent PPO** | Clipped surrogate objective with entropy regularization, generalized advantage estimation (GAE) |
-| **Modular Brain Architectures** | TronBrain (MLP), MirrorBrain (symmetric), TransformerBrain (self-attention) |
-| **Procedural Map Generation** | Random walk-based terrain with heal zones and control points |
-| **Interactive Visualization** | Pygame-based viewer with camera controls, agent inspection, and overlay modes |
-| **Comprehensive Telemetry** | Event logging (JSONL), life-cycle tracking, lineage graphs, movement analytics |
-| **Atomic Checkpointing** | Crash-safe save/resume with CPU-portable tensor serialization |
-| **Background Persistence** | Multiprocess-based results writer to avoid simulation stalls |
+| **Modular Brain Architectures** | TronBrain (MLP), MirrorBrain (symmetric), TransformerBrain (self-attention)         |
+| **Procedural Map Generation** | Random walk-based terrain with heal zones and control points                          |
+| **Interactive Visualization** | Pygame-based viewer with camera controls, agent inspection, and overlay modes         |
+| **Comprehensive Telemetry** | Event logging (JSONL), life-cycle tracking, lineage graphs, movement analytics          |
+| **Atomic Checkpointing** | Crash-safe save/resume with CPU-portable tensor serialization                              |
+| **Background Persistence** | Multiprocess-based results writer to avoid simulation stalls                             |
 
 ---
 
