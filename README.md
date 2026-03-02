@@ -264,5 +264,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-Acknowledgments
+
+#Acknowledgments
 This project was developed as a research platform for multi-agent reinforcement learning. The architecture draws inspiration from vectorized simulation frameworks and modern PPO implementations. The codebase prioritizes clarity, extensibility, and reproducibility for academic and industrial research applications.

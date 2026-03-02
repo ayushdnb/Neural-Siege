@@ -841,7 +841,7 @@ RESPAWN_RESET_OPT_ON_RESPAWN = _env_bool("FWS_RESET_OPT", True)
 
 # Spawn position jitter radius around chosen spawn point/parent point (runtime-dependent exact usage).
 # Env: FWS_RESP_JITTER
-RESPAWN_JITTER_RADIUS        = _env_int("FWS_RESP_JITTER", 3)
+RESPAWN_JITTER_RADIUS        = _env_int("FWS_RESP_JITTER", 1)
 
 # Cooldown per respawned entity/slot/team before another respawn (runtime-defined scope).
 # Env: FWS_RESPAWN_CD

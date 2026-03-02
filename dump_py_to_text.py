@@ -25,7 +25,7 @@ def main():
 
     # Gather all .py files (recursively), excluding ignored dirs
     py_files = []
-    for p in BASE_DIR.rglob("*.py"):
+    for p in BASE_DIR.rglob("*.py") or BASE_DIR.rglob("*.md"):
         if p.is_file() and not should_ignore(p.relative_to(BASE_DIR)):
             py_files.append(p)
 
