@@ -177,6 +177,11 @@ class PerAgentPPORuntime:
         self._sched: Dict[int, CosineAnnealingLR] = {}
         self._step = 0
 
+        # Additive telemetry cache (read-only to external observers).
+        # Updated only after successful train/update work.
+        self.last_train_summary: Optional[Dict[str, float]] = None
+        self._train_update_seq: int = 0
+
     # ------------------------------------------------------------------
     # Shape & device assertions (fail loudly on mismatch)
     # ------------------------------------------------------------------
@@ -464,6 +469,22 @@ class PerAgentPPORuntime:
         # Ensure no optimizer sharing (design invariant).
         self._assert_no_optimizer_sharing(aids)
 
+        # Additive PPO telemetry aggregation (observational only).
+        log_ppo_telem = bool(getattr(config, "TELEMETRY_LOG_PPO", False))
+        agg = {
+            "trained_slots": 0,
+            "samples": 0,
+            "optimizer_steps": 0,
+            "epochs_run": 0,
+            "loss_pi_sum": 0.0,
+            "loss_v_sum": 0.0,
+            "loss_ent_sum": 0.0,
+            "entropy_sum": 0.0,
+            "approx_kl_max": 0.0,
+            "lr_before_sum": 0.0,
+            "lr_after_sum": 0.0,
+        } if log_ppo_telem else None
+
         for aid in aids:
             aid = int(aid)
             b = self._buf.get(aid, None)
@@ -483,6 +504,7 @@ class PerAgentPPORuntime:
 
             # Ensure optimizer + scheduler exist.
             opt = self._get_opt(aid, model)
+            lr_before = float(opt.param_groups[0]["lr"]) if len(getattr(opt, "param_groups", [])) > 0 else float(self.lr)
 
             # Stack rollout lists into tensors:
             # T here is "buffer length" (could be < self.T for flush cases).
@@ -509,6 +531,8 @@ class PerAgentPPORuntime:
 
             with torch.enable_grad():
                 for _ in range(self.epochs):
+                    if log_ppo_telem:
+                        aid_epochs_run = locals().get("aid_epochs_run", 0) + 1
                     # Shuffle indices each epoch.
                     idx = torch.randperm(B, device=obs.device)
 
@@ -575,6 +599,15 @@ class PerAgentPPORuntime:
                         approx_kl = (logp_old_mb - logp).mean().item()
                         approx_kl_epoch = max(approx_kl_epoch, approx_kl)
 
+                        if log_ppo_telem:
+                            # Observational scalars only; no effect on optimizer semantics.
+                            aid_optimizer_steps = locals().get("aid_optimizer_steps", 0) + 1
+                            aid_loss_pi_sum = locals().get("aid_loss_pi_sum", 0.0) + float(loss_pi.detach().item())
+                            aid_loss_v_sum = locals().get("aid_loss_v_sum", 0.0) + float(loss_v.detach().item())
+                            aid_loss_ent_sum = locals().get("aid_loss_ent_sum", 0.0) + float(loss_ent.detach().item())
+                            aid_entropy_sum = locals().get("aid_entropy_sum", 0.0) + float(entropy.mean().detach().item())
+                            aid_approx_kl_max = max(float(locals().get("aid_approx_kl_max", 0.0)), float(approx_kl))
+
                     # Early stopping if KL exceeds target
                     if self.target_kl > 0.0 and approx_kl_epoch > self.target_kl:
                         break
@@ -582,6 +615,22 @@ class PerAgentPPORuntime:
             # Learning rate schedule update
             if aid in self._sched:
                 self._sched[aid].step()
+            lr_after = float(opt.param_groups[0]["lr"]) if len(getattr(opt, "param_groups", [])) > 0 else lr_before
+
+            if log_ppo_telem:
+                n_steps = int(locals().get("aid_optimizer_steps", 0))
+                if n_steps > 0:
+                    agg["trained_slots"] += 1
+                    agg["samples"] += int(B)
+                    agg["optimizer_steps"] += n_steps
+                    agg["epochs_run"] += int(locals().get("aid_epochs_run", 0))
+                    agg["loss_pi_sum"] += float(locals().get("aid_loss_pi_sum", 0.0))
+                    agg["loss_v_sum"] += float(locals().get("aid_loss_v_sum", 0.0))
+                    agg["loss_ent_sum"] += float(locals().get("aid_loss_ent_sum", 0.0))
+                    agg["entropy_sum"] += float(locals().get("aid_entropy_sum", 0.0))
+                    agg["approx_kl_max"] = max(float(agg["approx_kl_max"]), float(locals().get("aid_approx_kl_max", 0.0)))
+                    agg["lr_before_sum"] += float(lr_before)
+                    agg["lr_after_sum"] += float(lr_after)
 
             # Clear buffer after training
             b.obs.clear()
@@ -591,6 +640,27 @@ class PerAgentPPORuntime:
             b.rew.clear()
             b.done.clear()
             b.bootstrap = None
+
+        # Publish last train summary only after successful training work.
+        if log_ppo_telem and agg is not None and int(agg["trained_slots"]) > 0 and int(agg["optimizer_steps"]) > 0:
+            self._train_update_seq += 1
+            slots = max(1, int(agg["trained_slots"]))
+            steps = max(1, int(agg["optimizer_steps"]))
+            self.last_train_summary = {
+                "update_seq": float(self._train_update_seq),
+                "ppo_step": float(self._step),
+                "trained_slots": float(agg["trained_slots"]),
+                "samples": float(agg["samples"]),
+                "optimizer_steps": float(agg["optimizer_steps"]),
+                "epochs_run_total": float(agg["epochs_run"]),
+                "loss_pi_mean": float(agg["loss_pi_sum"]) / float(steps),
+                "loss_v_mean": float(agg["loss_v_sum"]) / float(steps),
+                "loss_ent_mean": float(agg["loss_ent_sum"]) / float(steps),
+                "entropy_mean": float(agg["entropy_sum"]) / float(steps),
+                "approx_kl_max": float(agg["approx_kl_max"]),
+                "lr_before_mean": float(agg["lr_before_sum"]) / float(slots),
+                "lr_after_mean": float(agg["lr_after_sum"]) / float(slots),
+            }
 
     def _train_window_and_clear(self) -> None:
         """
@@ -841,4 +911,4 @@ class PerAgentPPORuntime:
         logp = F.log_softmax(logits, dim=-1)
         entropy = -(logp.exp() * logp).sum(-1)
 
-        return logits, values, entropy
+        return logits, values, entropy  

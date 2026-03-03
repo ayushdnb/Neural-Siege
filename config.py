@@ -358,7 +358,38 @@ TELEMETRY_LOG_MOVES: bool = _env_bool("FWS_TELEM_MOVES", True)   # can be huge i
 # PPO telemetry logging (losses, KL, entropy, etc., depending on implementation).
 # Env: FWS_TELEM_PPO
 TELEMETRY_LOG_PPO: bool = _env_bool("FWS_TELEM_PPO", True)
+# ----------------------------------------------------------------------
+# Headless live CSV summary sidecar (additive; does NOT affect console prints)
+# ----------------------------------------------------------------------
+# Uses existing TELEMETRY_TICK_SUMMARY_EVERY for row cadence and existing
+# TELEMETRY_PERIODIC_FLUSH_EVERY for buffered streams. This sidecar writes rows
+# in append mode (file close per append), so rows are "live" without extra deps.
 
+# Master switch for additive headless live summary CSV (telemetry_summary.csv).
+# Env: FWS_TELEM_HEADLESS_SUMMARY
+TELEMETRY_HEADLESS_LIVE_SUMMARY: bool = _env_bool("FWS_TELEM_HEADLESS_SUMMARY", True)
+
+# Include wall-time/TPS columns in headless live summary.
+# Env: FWS_TELEM_SUMMARY_TPS
+TELEMETRY_HEADLESS_SUMMARY_INCLUDE_TPS: bool = _env_bool("FWS_TELEM_SUMMARY_TPS", True)
+
+# Include parsed GPU probe columns (util/mem/power) in headless live summary.
+# GPU polling is performed only on summary ticks by the headless loop.
+# Env: FWS_TELEM_SUMMARY_GPU
+TELEMETRY_HEADLESS_SUMMARY_INCLUDE_GPU: bool = _env_bool("FWS_TELEM_SUMMARY_GPU", True)
+
+# Include TickMetrics window aggregates (moved/attacks/deaths/cp deltas/etc.).
+# Env: FWS_TELEM_SUMMARY_TICK_METRICS
+TELEMETRY_HEADLESS_SUMMARY_INCLUDE_TICK_METRICS: bool = _env_bool("FWS_TELEM_SUMMARY_TICK_METRICS", True)
+
+# Include latest cached PPO train summary columns (if PPO runtime exposes them).
+# This is observational only and remains blank when PPO is disabled/unavailable.
+# Env: FWS_TELEM_SUMMARY_PPO
+TELEMETRY_HEADLESS_SUMMARY_INCLUDE_PPO: bool = _env_bool("FWS_TELEM_SUMMARY_PPO", True)
+
+# Log rare respawn mutation events to telemetry/mutation_events.csv (append).
+# Env: FWS_TELEM_MUTATIONS
+TELEMETRY_LOG_RARE_MUTATIONS: bool = _env_bool("FWS_TELEM_MUTATIONS", True)
 # Move event sampling controls:
 # These are critical for keeping logs manageable in large populations.
 

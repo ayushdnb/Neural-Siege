@@ -506,7 +506,8 @@ def _headless_loop(
                 # ------------------------------------------------------------
                 # 1) Advance the simulation by exactly one tick
                 # ------------------------------------------------------------
-                engine.run_tick()
+                tick_metrics = engine.run_tick()
+
 
                 # ------------------------------------------------------------
                 # 2) Log tick summary (non-blocking)
@@ -519,13 +520,32 @@ def _headless_loop(
                 deaths = stats.drain_dead_log()
                 if deaths:
                     rw.write_deaths(deaths)
+                # ------------------------------------------------------------
+                # 3b) Additive headless telemetry sidecar (decoupled from print mode)
+                # ------------------------------------------------------------
+                gpu_probe_line = None
+                telemetry = getattr(engine, "telemetry", None)
+                if telemetry is not None and getattr(telemetry, "enabled", False):
+                    try:
+                        # Poll GPU only on summary ticks (independent of console prints).
+                        want_gpu = bool(getattr(telemetry, "headless_summary_include_gpu", False))
+                        every = int(getattr(telemetry, "tick_summary_every", 0))
+                        if want_gpu and every > 0 and (int(stats.tick) % every) == 0:
+                            gpu_probe_line = nvidia_smi_summary()
 
+                        if hasattr(telemetry, "on_headless_tick"):
+                            telemetry.on_headless_tick(
+                                tick=int(stats.tick),
+                                tick_metrics=(tick_metrics if isinstance(tick_metrics, dict) else None),
+                                gpu_line=gpu_probe_line,
+                            )
+                    except Exception:
+                        # Fail-safe: telemetry must not crash headless runs.
+                        pass
                 # After completing this tick’s output work, exit if shutdown requested.
                 if getattr(engine, "shutdown_requested", {}).get("flag", False):
                     break
-                # -----------------------------------------------------------------
-                # ... (keep existing code unchanged) ...
-                # -----------------------------------------------------------------
+
 
                 # ------------------------------------------------------------
                 # 4) Periodic sanity check
@@ -578,7 +598,8 @@ def _headless_loop(
                 # ------------------------------------------------------------
                 pe = int(getattr(config, "HEADLESS_PRINT_EVERY_TICKS", 100))
                 if pe > 0 and (stats.tick % pe) == 0:
-                    gpu = nvidia_smi_summary() or "-"
+                    # Reuse GPU probe if already collected for telemetry on this tick.
+                    gpu = (gpu_probe_line if gpu_probe_line is not None else nvidia_smi_summary()) or "-"
                     lvl = int(getattr(config, "HEADLESS_PRINT_LEVEL", 1))
                     show_gpu = bool(getattr(config, "HEADLESS_PRINT_GPU", True))
 
@@ -771,7 +792,11 @@ def main() -> None:
             engine.telemetry = telemetry
 
             # Give telemetry access to registry/stats for context
-            telemetry.attach_context(registry=registry, stats=stats)
+            telemetry.attach_context(
+                registry=registry,
+                stats=stats,
+                ppo_runtime=getattr(engine, "_ppo", None),
+            )
 
             # Write run metadata for provenance
             telemetry.write_run_meta(
@@ -810,7 +835,7 @@ def main() -> None:
     # Wrap engine.run_tick so we can record frames without modifying TickEngine itself.
     _orig_run_tick = engine.run_tick
 
-    def _run_tick_with_recording() -> None:
+    def _run_tick_with_recording():
         """
         Decorator-style wrapper around engine.run_tick.
 
@@ -821,11 +846,13 @@ def main() -> None:
 
         It lets us add recording behavior without editing engine code.
         """
-        _orig_run_tick()
+        out = _orig_run_tick()
 
         if recorder.enabled and (stats.tick % getattr(config, "VIDEO_EVERY_TICKS", 1) == 0):
             recorder.write()
-
+        # Preserve original run_tick() return value (TickMetrics dict) so callers like
+        # headless telemetry can consume it without changing TickEngine.
+        return out
     engine.run_tick = _run_tick_with_recording  # monkey-patch: replace method at runtime
 
     # ------------------------------------------------------------------

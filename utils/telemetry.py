@@ -376,6 +376,8 @@ class TelemetrySession:
         # Movement aggregates (cheap) + generic extension counters (long format)
         self.move_summary_path = self.telemetry_dir / "move_summary.csv"
         self.counters_path = self.telemetry_dir / "counters.csv"
+        self.headless_summary_path = self.telemetry_dir / "telemetry_summary.csv"
+        self.mutation_events_path = self.telemetry_dir / "mutation_events.csv"
 
         # Create directories (safe even if they already exist).
         self.telemetry_dir.mkdir(parents=True, exist_ok=True)
@@ -406,16 +408,62 @@ class TelemetrySession:
         self.tick_summary_every: int = int(getattr(config, "TELEMETRY_TICK_SUMMARY_EVERY", 0))
 
         # ---------------------------------------------------------------------
+        # Additive headless live summary sidecar (CSV append, independent of prints)
+        # ---------------------------------------------------------------------
+        self.headless_live_summary_enabled: bool = bool(getattr(config, "TELEMETRY_HEADLESS_LIVE_SUMMARY", True))
+        self.headless_summary_include_tps: bool = bool(getattr(config, "TELEMETRY_HEADLESS_SUMMARY_INCLUDE_TPS", True))
+        self.headless_summary_include_gpu: bool = bool(getattr(config, "TELEMETRY_HEADLESS_SUMMARY_INCLUDE_GPU", False))
+        self.headless_summary_include_tick_metrics: bool = bool(
+            getattr(config, "TELEMETRY_HEADLESS_SUMMARY_INCLUDE_TICK_METRICS", True)
+        )
+        self.headless_summary_include_ppo: bool = bool(getattr(config, "TELEMETRY_HEADLESS_SUMMARY_INCLUDE_PPO", True))
+        self.log_rare_mutations: bool = bool(getattr(config, "TELEMETRY_LOG_RARE_MUTATIONS", True))
+
+        # ---------------------------------------------------------------------
         # Context references (never mutates; just pointers for reading data)
         # ---------------------------------------------------------------------
         self._registry: Any = None
         self._stats: Any = None
+        self._ppo_runtime: Any = None
 
         # ---------------------------------------------------------------------
         # Buffered side-streams (flushed on the same cadence as event chunks)
         # ---------------------------------------------------------------------
         self._move_agg_buf: List[Dict[str, Any]] = []
         self._counters_buf: List[Tuple[int, str, float]] = []
+
+        # Headless summary runtime state (additive)
+        self._headless_wall_start: Optional[float] = None
+        self._headless_wall_start_tick: Optional[int] = None
+        self._headless_prev_summary_wall: Optional[float] = None
+        self._headless_prev_summary_tick: Optional[int] = None
+        self._headless_gpu_raw: Optional[str] = None
+        self._headless_gpu_parsed: Dict[str, Any] = {}
+        self._headless_prev_cp_red: Optional[float] = None
+        self._headless_prev_cp_blue: Optional[float] = None
+        self._headless_prev_dmg_dealt_red: Optional[float] = None
+        self._headless_prev_dmg_dealt_blue: Optional[float] = None
+        self._headless_prev_dmg_taken_red: Optional[float] = None
+        self._headless_prev_dmg_taken_blue: Optional[float] = None
+        self._headless_tick_metrics_window: Dict[str, float] = {}
+        self._headless_tick_metrics_window_ticks: int = 0
+
+        self._headless_tick_metric_keys = [
+            "alive",
+            "moved",
+            "attacks",
+            "deaths",
+            "deaths_combat",
+            "deaths_metabolism",
+            "cp_red_tick",
+            "cp_blue_tick",
+            "move_attempted",
+            "move_can_move",
+            "move_blocked_wall",
+            "move_blocked_occupied",
+            "move_conflict_lost",
+            "move_conflict_tie",
+        ]
 
         # ---------------------------------------------------------------------
         # AgentStatic deduplication: track which agent_ids already written
@@ -490,6 +538,40 @@ class TelemetrySession:
                     "red_alive", "blue_alive", "mean_hp_red", "mean_hp_blue",
                     "red_kills", "blue_kills", "red_deaths", "blue_deaths",
                     "red_dmg_dealt", "blue_dmg_dealt", "red_dmg_taken", "blue_dmg_taken",
+                ],
+                rows=[],
+            )
+
+        # Additive headless live summary CSV (superset sidecar; leaves tick_summary.csv unchanged)
+        if (
+            self.enabled
+            and self.headless_live_summary_enabled
+            and self.tick_summary_every > 0
+            and (not self.headless_summary_path.exists())
+        ):
+            self._append_csv_rows(
+                self.headless_summary_path,
+                fieldnames=self._headless_summary_fieldnames(),
+                rows=[],
+            )
+
+        # Rare mutation event CSV (append, low frequency)
+        if self.enabled and self.log_rare_mutations and (not self.mutation_events_path.exists()):
+            self._append_csv_rows(
+                self.mutation_events_path,
+                fieldnames=[
+                    "tick",
+                    "slot",
+                    "agent_id",
+                    "team_id",
+                    "team_name",
+                    "unit_id",
+                    "spawn_hp",
+                    "spawn_atk",
+                    "spawn_vis",
+                    "parent_agent_id",
+                    "cloned",
+                    "mutation_std",
                 ],
                 rows=[],
             )
@@ -1271,7 +1353,7 @@ class TelemetrySession:
     # Public API called from main/tick
     # =============================================================================
 
-    def attach_context(self, registry: Any, stats: Any) -> None:
+    def attach_context(self, registry: Any, stats: Any, ppo_runtime: Any = None) -> None:
         """
         Attach references to simulation objects that telemetry can read.
 
@@ -1292,6 +1374,304 @@ class TelemetrySession:
         """
         self._registry = registry
         self._stats = stats
+        self._ppo_runtime = ppo_runtime
+
+    def _headless_summary_fieldnames(self) -> List[str]:
+        fields = [
+            "tick",
+            "sim_elapsed_s",
+            "wall_elapsed_s",
+            "dt_since_last_summary_s",
+            "tick_delta_since_last_summary",
+            "tps_window",
+            "tps_avg",
+            "score_red",
+            "score_blue",
+            "cp_total_red",
+            "cp_total_blue",
+            "cp_delta_red",
+            "cp_delta_blue",
+            "alive_red",
+            "alive_blue",
+            "hp_mean_red",
+            "hp_mean_blue",
+            "kills_red",
+            "kills_blue",
+            "deaths_red",
+            "deaths_blue",
+            "dmg_dealt_red",
+            "dmg_dealt_blue",
+            "dmg_taken_red",
+            "dmg_taken_blue",
+            "dmg_dealt_delta_red",
+            "dmg_dealt_delta_blue",
+            "dmg_taken_delta_red",
+            "dmg_taken_delta_blue",
+            "tick_metrics_window_ticks",
+        ]
+        if self.headless_summary_include_gpu:
+            fields.extend([
+                "gpu_raw",
+                "gpu_util_pct",
+                "gpu_mem_used_mb",
+                "gpu_mem_total_mb",
+                "gpu_mem_pct",
+                "gpu_power_w",
+            ])
+        if self.headless_summary_include_tick_metrics:
+            fields.extend([f"tm_{k}_sum" for k in self._headless_tick_metric_keys])
+        if self.headless_summary_include_ppo:
+            fields.extend([
+                "ppo_update_seq",
+                "ppo_step",
+                "ppo_trained_slots",
+                "ppo_samples",
+                "ppo_optimizer_steps",
+                "ppo_epochs_run_total",
+                "ppo_loss_pi_mean",
+                "ppo_loss_v_mean",
+                "ppo_loss_ent_mean",
+                "ppo_entropy_mean",
+                "ppo_approx_kl_max",
+                "ppo_lr_before_mean",
+                "ppo_lr_after_mean",
+            ])
+        return fields
+
+    @staticmethod
+    def _parse_gpu_summary_line(line: Optional[str]) -> Dict[str, Any]:
+        if not line:
+            return {}
+        try:
+            parts = [p.strip() for p in str(line).split(",")]
+            if len(parts) < 4:
+                return {"gpu_raw": str(line)}
+            util = float(parts[0])
+            mem_used = float(parts[1])
+            mem_total = float(parts[2])
+            power = float(parts[3])
+            mem_pct = (100.0 * mem_used / mem_total) if mem_total > 0 else None
+            return {
+                "gpu_raw": str(line),
+                "gpu_util_pct": util,
+                "gpu_mem_used_mb": mem_used,
+                "gpu_mem_total_mb": mem_total,
+                "gpu_mem_pct": mem_pct,
+                "gpu_power_w": power,
+            }
+        except Exception:
+            return {"gpu_raw": str(line)}
+
+    def on_headless_tick(
+        self,
+        tick: int,
+        tick_metrics: Optional[Dict[str, Any]] = None,
+        gpu_line: Optional[str] = None,
+    ) -> None:
+        """
+        Additive headless-only hook:
+        - accumulates per-tick metrics window
+        - caches latest GPU probe (if provided)
+        - writes telemetry_summary.csv every `tick_summary_every` ticks
+
+        This is intentionally independent from console print verbosity.
+        """
+        if (not self.enabled) or (not self.headless_live_summary_enabled):
+            return
+
+        try:
+            if gpu_line is not None:
+                self._headless_gpu_raw = str(gpu_line)
+                self._headless_gpu_parsed = self._parse_gpu_summary_line(gpu_line)
+
+            if tick_metrics and self.headless_summary_include_tick_metrics:
+                for k in self._headless_tick_metric_keys:
+                    v = tick_metrics.get(k, None)
+                    if v is None:
+                        continue
+                    try:
+                        self._headless_tick_metrics_window[k] = float(self._headless_tick_metrics_window.get(k, 0.0)) + float(v)
+                    except Exception:
+                        continue
+                self._headless_tick_metrics_window_ticks += 1
+
+            if self.tick_summary_every > 0 and (int(tick) % int(self.tick_summary_every)) == 0:
+                self._write_headless_summary(int(tick))
+        except Exception as e:
+            self._anomaly(f"headless summary hook failed: {e}")
+
+    def _write_headless_summary(self, tick: int) -> None:
+        if (not self.enabled) or (self._registry is None) or (self._stats is None):
+            return
+        try:
+            import time
+            from engine.agent_registry import COL_ALIVE, COL_TEAM, COL_HP
+
+            now = float(time.perf_counter())
+            if self._headless_wall_start is None:
+                self._headless_wall_start = now
+                self._headless_wall_start_tick = int(tick)
+
+            wall_elapsed = ""
+            if self._headless_wall_start is not None:
+                wall_elapsed = float(now - self._headless_wall_start)
+
+            dt_since_last = ""
+            tick_delta = ""
+            tps_window = ""
+            if self._headless_prev_summary_wall is not None and self._headless_prev_summary_tick is not None:
+                dt = float(now - self._headless_prev_summary_wall)
+                dt_since_last = dt
+                tick_delta_i = int(tick) - int(self._headless_prev_summary_tick)
+                tick_delta = tick_delta_i
+                if dt > 0 and tick_delta_i >= 0:
+                    tps_window = float(tick_delta_i) / dt
+
+            tps_avg = ""
+            if (
+                self.headless_summary_include_tps
+                and self._headless_wall_start is not None
+                and self._headless_wall_start_tick is not None
+            ):
+                dt0 = float(now - self._headless_wall_start)
+                dticks0 = int(tick) - int(self._headless_wall_start_tick)
+                if dt0 > 0 and dticks0 >= 0:
+                    tps_avg = float(dticks0) / dt0
+
+            data = self._registry.agent_data
+            alive_mask = (data[:, COL_ALIVE] > 0.5)
+            red_mask = alive_mask & (data[:, COL_TEAM] == 2.0)
+            blue_mask = alive_mask & (data[:, COL_TEAM] == 3.0)
+            red_n = int(red_mask.sum().item())
+            blue_n = int(blue_mask.sum().item())
+            mean_red = float(data[red_mask, COL_HP].mean().item()) if red_n > 0 else 0.0
+            mean_blue = float(data[blue_mask, COL_HP].mean().item()) if blue_n > 0 else 0.0
+
+            s = self._stats
+            red_obj = getattr(s, "red", None)
+            blue_obj = getattr(s, "blue", None)
+
+            cp_red = float(getattr(red_obj, "cp_points", 0.0))
+            cp_blue = float(getattr(blue_obj, "cp_points", 0.0))
+            dmg_dealt_red = float(getattr(red_obj, "dmg_dealt", 0.0))
+            dmg_dealt_blue = float(getattr(blue_obj, "dmg_dealt", 0.0))
+            dmg_taken_red = float(getattr(red_obj, "dmg_taken", 0.0))
+            dmg_taken_blue = float(getattr(blue_obj, "dmg_taken", 0.0))
+
+            def _delta(cur: float, prev: Optional[float]):
+                return (cur - float(prev)) if prev is not None else ""
+
+            row: Dict[str, Any] = {
+                "tick": int(tick),
+                "sim_elapsed_s": float(getattr(s, "elapsed_seconds", 0.0)),
+                "wall_elapsed_s": wall_elapsed,
+                "dt_since_last_summary_s": (dt_since_last if self.headless_summary_include_tps else ""),
+                "tick_delta_since_last_summary": (tick_delta if self.headless_summary_include_tps else ""),
+                "tps_window": (tps_window if self.headless_summary_include_tps else ""),
+                "tps_avg": (tps_avg if self.headless_summary_include_tps else ""),
+                "score_red": float(getattr(red_obj, "score", 0.0)),
+                "score_blue": float(getattr(blue_obj, "score", 0.0)),
+                "cp_total_red": cp_red,
+                "cp_total_blue": cp_blue,
+                "cp_delta_red": _delta(cp_red, self._headless_prev_cp_red),
+                "cp_delta_blue": _delta(cp_blue, self._headless_prev_cp_blue),
+                "alive_red": red_n,
+                "alive_blue": blue_n,
+                "hp_mean_red": mean_red,
+                "hp_mean_blue": mean_blue,
+                "kills_red": float(getattr(red_obj, "kills", 0.0)),
+                "kills_blue": float(getattr(blue_obj, "kills", 0.0)),
+                "deaths_red": float(getattr(red_obj, "deaths", 0.0)),
+                "deaths_blue": float(getattr(blue_obj, "deaths", 0.0)),
+                "dmg_dealt_red": dmg_dealt_red,
+                "dmg_dealt_blue": dmg_dealt_blue,
+                "dmg_taken_red": dmg_taken_red,
+                "dmg_taken_blue": dmg_taken_blue,
+                "dmg_dealt_delta_red": _delta(dmg_dealt_red, self._headless_prev_dmg_dealt_red),
+                "dmg_dealt_delta_blue": _delta(dmg_dealt_blue, self._headless_prev_dmg_dealt_blue),
+                "dmg_taken_delta_red": _delta(dmg_taken_red, self._headless_prev_dmg_taken_red),
+                "dmg_taken_delta_blue": _delta(dmg_taken_blue, self._headless_prev_dmg_taken_blue),
+                "tick_metrics_window_ticks": int(self._headless_tick_metrics_window_ticks),
+            }
+
+            if self.headless_summary_include_gpu:
+                row.update({
+                    "gpu_raw": self._headless_gpu_parsed.get("gpu_raw", self._headless_gpu_raw or ""),
+                    "gpu_util_pct": self._headless_gpu_parsed.get("gpu_util_pct", ""),
+                    "gpu_mem_used_mb": self._headless_gpu_parsed.get("gpu_mem_used_mb", ""),
+                    "gpu_mem_total_mb": self._headless_gpu_parsed.get("gpu_mem_total_mb", ""),
+                    "gpu_mem_pct": self._headless_gpu_parsed.get("gpu_mem_pct", ""),
+                    "gpu_power_w": self._headless_gpu_parsed.get("gpu_power_w", ""),
+                })
+
+            if self.headless_summary_include_tick_metrics:
+                for k in self._headless_tick_metric_keys:
+                    row[f"tm_{k}_sum"] = self._headless_tick_metrics_window.get(k, 0.0)
+
+            if self.headless_summary_include_ppo:
+                p = getattr(self, "_ppo_runtime", None)
+                p_last = getattr(p, "last_train_summary", None) if p is not None else None
+                row.update({
+                    "ppo_update_seq": (p_last.get("update_seq", "") if isinstance(p_last, dict) else ""),
+                    "ppo_step": (p_last.get("ppo_step", "") if isinstance(p_last, dict) else ""),
+                    "ppo_trained_slots": (p_last.get("trained_slots", "") if isinstance(p_last, dict) else ""),
+                    "ppo_samples": (p_last.get("samples", "") if isinstance(p_last, dict) else ""),
+                    "ppo_optimizer_steps": (p_last.get("optimizer_steps", "") if isinstance(p_last, dict) else ""),
+                    "ppo_epochs_run_total": (p_last.get("epochs_run_total", "") if isinstance(p_last, dict) else ""),
+                    "ppo_loss_pi_mean": (p_last.get("loss_pi_mean", "") if isinstance(p_last, dict) else ""),
+                    "ppo_loss_v_mean": (p_last.get("loss_v_mean", "") if isinstance(p_last, dict) else ""),
+                    "ppo_loss_ent_mean": (p_last.get("loss_ent_mean", "") if isinstance(p_last, dict) else ""),
+                    "ppo_entropy_mean": (p_last.get("entropy_mean", "") if isinstance(p_last, dict) else ""),
+                    "ppo_approx_kl_max": (p_last.get("approx_kl_max", "") if isinstance(p_last, dict) else ""),
+                    "ppo_lr_before_mean": (p_last.get("lr_before_mean", "") if isinstance(p_last, dict) else ""),
+                    "ppo_lr_after_mean": (p_last.get("lr_after_mean", "") if isinstance(p_last, dict) else ""),
+                })
+
+            self._append_csv_rows(
+                self.headless_summary_path,
+                fieldnames=self._headless_summary_fieldnames(),
+                rows=[row],
+            )
+
+            # Commit window baselines only after successful write.
+            self._headless_prev_summary_wall = now
+            self._headless_prev_summary_tick = int(tick)
+            self._headless_prev_cp_red = cp_red
+            self._headless_prev_cp_blue = cp_blue
+            self._headless_prev_dmg_dealt_red = dmg_dealt_red
+            self._headless_prev_dmg_dealt_blue = dmg_dealt_blue
+            self._headless_prev_dmg_taken_red = dmg_taken_red
+            self._headless_prev_dmg_taken_blue = dmg_taken_blue
+            self._headless_tick_metrics_window.clear()
+            self._headless_tick_metrics_window_ticks = 0
+
+        except Exception as e:
+            self._anomaly(f"headless summary write failed: {e}")
+
+    def record_mutation_event(self, row: Dict[str, Any]) -> None:
+        if (not self.enabled) or (not self.log_rare_mutations):
+            return
+        try:
+            self._append_csv_rows(
+                self.mutation_events_path,
+                fieldnames=[
+                    "tick",
+                    "slot",
+                    "agent_id",
+                    "team_id",
+                    "team_name",
+                    "unit_id",
+                    "spawn_hp",
+                    "spawn_atk",
+                    "spawn_vis",
+                    "parent_agent_id",
+                    "cloned",
+                    "mutation_std",
+                ],
+                rows=[row],
+            )
+        except Exception as e:
+            self._anomaly(f"mutation event write failed: {e}")
 
     def write_run_meta(self, meta: Dict[str, Any]) -> None:
         """
@@ -1563,6 +1943,24 @@ class TelemetrySession:
             unit = _to_int(m.get("unit_id"))
             parent = m.get("parent_agent_id", None)
             parent_id = (_to_int(parent) if parent is not None else None)
+
+            # Additive rare mutation CSV sidecar (observational only).
+            if bool(m.get("rare_mutation", False)):
+                team_name = "red" if int(team) == 2 else ("blue" if int(team) == 3 else str(team))
+                self.record_mutation_event({
+                    "tick": int(tick),
+                    "slot": int(slot),
+                    "agent_id": int(aid),
+                    "team_id": int(team),
+                    "team_name": str(team_name),
+                    "unit_id": int(unit),
+                    "spawn_hp": float(m.get("spawn_hp", "")) if m.get("spawn_hp", None) is not None else "",
+                    "spawn_atk": float(m.get("spawn_atk", "")) if m.get("spawn_atk", None) is not None else "",
+                    "spawn_vis": int(m.get("spawn_vis", 0)) if m.get("spawn_vis", None) is not None else "",
+                    "parent_agent_id": (int(parent_id) if parent_id is not None else ""),
+                    "cloned": bool(m.get("cloned", False)),
+                    "mutation_std": float(m.get("mutation_std", 0.0)),
+                })
 
             self.record_birth(
                 tick=tick,

@@ -908,8 +908,10 @@ def _respawn_some(
         #
         # Note: random.uniform(0.5, 2.0) returns value in [0.5, 2.0].
         # Thus multiplier is in [1.5, 3.0].
+        rare_mutation = False
         _respawn_counter += 1
         if _respawn_counter % 1000 == 0:
+            rare_mutation = True
             hp0 *= (1.0 + random.uniform(0.5, 2.0))
             atk0 *= (1.0 + random.uniform(0.5, 2.0))
             vision0 = int(vision0 * (1.0 + random.uniform(0.5, 2.0)))
@@ -970,6 +972,11 @@ def _respawn_some(
                 "parent_slot": int(pj) if use_clone else None,
                 "parent_agent_id": int(parent_aid) if parent_aid is not None else None,
                 "mutation_std": float(cfg.mutation_std),
+                # Additive observability fields (no behavior impact)
+                "rare_mutation": bool(rare_mutation),
+                "spawn_hp": float(hp0),
+                "spawn_atk": float(atk0),
+                "spawn_vis": int(vision0),
             })
 
         # Update grid to reflect the spawned agent.
