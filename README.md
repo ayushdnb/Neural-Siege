@@ -86,27 +86,27 @@ This makes it suitable for experiments in:
 
 ```mermaid
 flowchart TD
-    A[config.py / FWS_*] --> B[main.py]
+    A["config.py / FWS_*"] --> B["main.py"]
 
-    B --> C[TickEngine]
-    B --> D[CheckpointManager]
-    B --> E[ResultsWriter]
-    B --> F[TelemetrySession]
-    B --> G[Viewer (optional)]
-    B --> H[Recorder (optional)]
+    B --> C["TickEngine"]
+    B --> D["CheckpointManager"]
+    B --> E["ResultsWriter"]
+    B --> F["TelemetrySession"]
+    B --> G["Viewer (optional)"]
+    B --> H["Recorder (optional)"]
 
-    C --> I[AgentsRegistry]
-    C --> J[Grid Tensor]
-    C --> K[Mapgen / Zones / Spawn / Respawn]
-    C --> L[Ray Engine + Move Mask]
-    C --> M[SimulationStats]
+    C --> I["AgentsRegistry"]
+    C --> J["Grid Tensor"]
+    C --> K["Mapgen / Zones / Spawn / Respawn"]
+    C --> L["Ray Engine + Move Mask"]
+    C --> M["SimulationStats"]
 
-    C --> N[Bucketed inference via ensemble_forward]
-    N --> O[TronBrain]
-    N --> P[MirrorBrain]
-    N --> Q[TransformerBrain]
+    C --> N["Bucketed inference via ensemble_forward"]
+    N --> O["TronBrain"]
+    N --> P["MirrorBrain"]
+    N --> Q["TransformerBrain"]
 
-    C --> R[PerAgentPPORuntime (optional)]
+    C --> R["PerAgentPPORuntime (optional)"]
     R --> F
     R --> I
 
@@ -114,10 +114,10 @@ flowchart TD
     D --> I
     D --> M
 
-    F --> S[telemetry/*.csv + events/*.jsonl]
-    E --> T[stats.csv / dead_agents_log.csv / config.json]
-    D --> U[checkpoints/ckpt_t*/]
-    H --> V[video / frames outputs]
+    F --> S["telemetry/*.csv + events/*.jsonl"]
+    E --> T["stats.csv / dead_agents_log.csv / config.json"]
+    D --> U["checkpoints/ckpt_t*/"]
+    H --> V["video / frames outputs"]
 ```
 
 ### Architecture Notes
@@ -131,38 +131,38 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Set env vars / profile] --> B[python main.py]
-    B --> C{Checkpoint path provided?}
+    A["Set env vars / profile"] --> B["python main.py"]
+    B --> C{"Checkpoint path provided?"}
 
-    C -- No --> D[Fresh init\nGrid + map + zones + spawn]
-    C -- Yes --> E[Load checkpoint\nRestore world + RNG + PPO state]
+    C -- No --> D["Fresh init\nGrid + map + zones + spawn"]
+    C -- Yes --> E["Load checkpoint\nRestore world + RNG + PPO state"]
 
-    D --> F[Create TickEngine]
+    D --> F["Create TickEngine"]
     E --> F
 
-    F --> G{Inspector no-output mode?}
-    G -- Yes --> H[Viewer-only path\nNo artifacts]
-    G -- No --> I[Create run_dir + ResultsWriter]
+    F --> G{"Inspector no-output mode?"}
+    G -- Yes --> H["Viewer-only path\nNo artifacts"]
+    G -- No --> I["Create run_dir + ResultsWriter"]
 
-    I --> J[CheckpointManager]
-    J --> K[TelemetrySession]
+    I --> J["CheckpointManager"]
+    J --> K["TelemetrySession"]
 
-    K --> L{UI enabled?}
-    L -- Yes --> M[Viewer.run()]
-    L -- No --> N[Headless loop]
+    K --> L{"UI enabled?"}
+    L -- Yes --> M["Viewer.run()"]
+    L -- No --> N["Headless loop"]
 
-    M --> O[engine.run_tick()]
+    M --> O["engine.run_tick()"]
     N --> O
 
-    O --> P[Observe + raycast + action masks]
-    P --> Q[Bucketed policy inference]
-    Q --> R[Combat / movement / zones / rewards]
-    R --> S[PPO record/update (optional)]
-    S --> T[Periodic telemetry + checkpoints]
+    O --> P["Observe + raycast + action masks"]
+    P --> Q["Bucketed policy inference"]
+    Q --> R["Combat / movement / zones / rewards"]
+    R --> S["PPO record/update (optional)"]
+    S --> T["Periodic telemetry + checkpoints"]
 
-    T --> U[Shutdown / interrupt / crash]
-    U --> V[On-exit checkpoint (optional)]
-    U --> W[Flush summaries + close writers]
+    T --> U["Shutdown / interrupt / crash"]
+    U --> V["On-exit checkpoint (optional)"]
+    U --> W["Flush summaries + close writers"]
 ```
 
 ### Runtime Modes
