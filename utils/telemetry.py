@@ -1643,10 +1643,10 @@ class TelemetrySession:
 
                 if not recovered:
                     # Surface once (still keep _anomaly behavior)
-                    try:
-                        print(f"[telemetry] ppo rich telemetry flush failed: {type(e).__name__}: {e}")
-                    except Exception:
-                        pass
+                    #try:
+                    #    print(f"[telemetry] ppo rich telemetry flush failed: {type(e).__name__}: {e}")
+                    #except Exception:
+                    #    pass
                     self._anomaly(f"ppo rich telemetry flush failed: {e}")
 
     def _headless_summary_fieldnames(self) -> List[str]:

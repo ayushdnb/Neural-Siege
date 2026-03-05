@@ -257,7 +257,7 @@ CHECKPOINT_TRIGGER_FILE = _env_str("FWS_CHECKPOINT_TRIGGER_FILE", "checkpoint.no
 # Env: FWS_HEADLESS_PRINT_EVERY_TICKS
 # 0 disables headless tick prints.
 # For overnight speed, larger intervals usually improve TPS.
-HEADLESS_PRINT_EVERY_TICKS = _env_int("FWS_HEADLESS_PRINT_EVERY_TICKS", 500)  # 0 disables
+HEADLESS_PRINT_EVERY_TICKS = _env_int("FWS_HEADLESS_PRINT_EVERY_TICKS", 1000)  # 0 disables
 
 # Print verbosity level for headless mode (downstream runtime decides exact behavior).
 # Env: FWS_HEADLESS_PRINT_LEVEL
@@ -267,7 +267,7 @@ HEADLESS_PRINT_LEVEL = _env_int("FWS_HEADLESS_PRINT_LEVEL", 2)               # 0
 # Whether to include GPU info in headless prints (can add subprocess/API overhead depending on impl).
 # Env: FWS_HEADLESS_PRINT_GPU
 # If TPS is critical and GPU telemetry polling is expensive, set False.
-HEADLESS_PRINT_GPU = _env_bool("FWS_HEADLESS_PRINT_GPU", True)
+HEADLESS_PRINT_GPU = _env_bool("FWS_HEADLESS_PRINT_GPU", False)
 
 # =============================================================================
 # 📡 SCIENTIFIC RECORDING / TELEMETRY (NON-INVASIVE, CONFIG-FIRST)
@@ -376,7 +376,7 @@ TELEMETRY_LOG_PPO: bool = _env_bool("FWS_TELEM_PPO", True)
 # Dedicated rich PPO training diagnostics CSV (separate from headless summary).
 # File: telemetry/ppo_training_telemetry.csv
 # Env: FWS_TELEM_PPO_RICH_CSV
-TELEMETRY_PPO_RICH_CSV: bool = _env_bool("FWS_TELEM_PPO_RICH_CSV", True)
+TELEMETRY_PPO_RICH_CSV: bool = _env_bool("FWS_TELEM_PPO_RICH_CSV", False)
 
 # Rich PPO telemetry write granularity: "update", "epoch", or "minibatch".
 # Higher detail gives better diagnostics but increases I/O/CSV size.
@@ -443,7 +443,7 @@ TELEMETRY_MOVE_EVENTS_MAX_PER_TICK: int = _env_int("FWS_TELEM_MOVE_MAX", 256)
 # Range typically [0.0, 1.0]
 # - 1.0 = keep all sampled candidates
 # - 0.1 = keep ~10%
-TELEMETRY_MOVE_EVENTS_SAMPLE_RATE: float = _env_float("FWS_TELEM_MOVE_RATE", 1.0)
+TELEMETRY_MOVE_EVENTS_SAMPLE_RATE: float = _env_float("FWS_TELEM_MOVE_RATE", 0.4)
 
 # Optional counters emission cadence.
 # Env: FWS_TELEM_COUNTERS_EVERY
@@ -566,12 +566,12 @@ GRID_HEIGHT = _env_int("FWS_GRID_H", 100)
 # Env: FWS_START_PER_TEAM
 # Higher => more immediate pressure/contact, more compute.
 # Ensure MAX_AGENTS can accommodate both teams + respawn dynamics.
-START_AGENTS_PER_TEAM = _env_int("FWS_START_PER_TEAM", 300)
+START_AGENTS_PER_TEAM = _env_int("FWS_START_PER_TEAM", 150)
 
 # Maximum total agent slots/capacity (global).
 # Env: FWS_MAX_AGENTS
 # If too low, respawn may be slot-constrained. If too high, memory/compute increases.
-MAX_AGENTS  = _env_int("FWS_MAX_AGENTS", 700)
+MAX_AGENTS  = _env_int("FWS_MAX_AGENTS", 350)
 
 # Hard tick limit for run termination.
 # Env: FWS_TICK_LIMIT
@@ -597,7 +597,7 @@ AGENT_FEATURES = 10  # DO NOT CHANGE (schema contract)
 # Env: FWS_RAND_WALLS
 # More walls => more choke points and possible partitioning.
 # Fewer walls => cleaner topology for behavior debugging.
-RANDOM_WALLS = _env_int("FWS_RAND_WALLS", 9)
+RANDOM_WALLS = _env_int("FWS_RAND_WALLS", 12)
 
 # Minimum wall segment length.
 # Env: FWS_WALL_SEG_MIN
@@ -607,7 +607,7 @@ WALL_SEG_MIN = _env_int("FWS_WALL_SEG_MIN", 5)
 # Maximum wall segment length.
 # Env: FWS_WALL_SEG_MAX
 # If very large relative to grid size, risk of accidental partitioning increases.
-WALL_SEG_MAX = _env_int("FWS_WALL_SEG_MAX", 30)
+WALL_SEG_MAX = _env_int("FWS_WALL_SEG_MAX", 77)
 
 # Margin from boundaries or protected areas for wall placement (implementation-dependent exact usage).
 # Env: FWS_WALL_MARGIN
@@ -654,12 +654,12 @@ HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.003)
 # Number of capture points.
 # Env: FWS_CP_COUNT
 # 1 large CP often creates strongest convergence to a shared objective.
-CP_COUNT           = _env_int("FWS_CP_COUNT", 3)
+CP_COUNT           = _env_int("FWS_CP_COUNT", 5)
 
 # Capture point size ratio.
 # Env: FWS_CP_SIZE_RATIO
 # Larger values increase contact probability but may reduce tactical variety.
-CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 0.11)
+CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 0.09)
 
 # Team reward per tick for owning/outnumbering on CP (fed into team reward path).
 # Env: FWS_CP_REWARD
@@ -689,7 +689,7 @@ SOLDIER_HP = _env_float("FWS_SOLDIER_HP", 1.0)
 # Archer base HP.
 # Env: FWS_ARCHER_HP
 # Lower HP makes positioning and line-of-sight more critical.
-ARCHER_HP  = _env_float("FWS_ARCHER_HP", 0.65)
+ARCHER_HP  = _env_float("FWS_ARCHER_HP", 0.45)
 
 # Base attack reference (generic/shared fallback).
 # Env: FWS_BASE_ATK
@@ -750,7 +750,7 @@ VISION_RANGE_SOLDIER = _env_int("FWS_VISION_SOLDIER", 6)
 
 # Archer vision range.
 # Env: FWS_VISION_ARCHER
-VISION_RANGE_ARCHER  = _env_int("FWS_VISION_ARCHER", 8)
+VISION_RANGE_ARCHER  = _env_int("FWS_VISION_ARCHER", 14)
 
 # Convenience mapping by unit type.
 # This allows downstream code to query per-class vision cleanly.
@@ -767,7 +767,7 @@ RAY_MAX_STEPS     = RAYCAST_MAX_STEPS
 # Instinct radius (broader neighborhood context features).
 # Env: FWS_INSTINCT_RADIUS
 # Increasing may improve macro-context awareness but can increase feature computation cost.
-INSTINCT_RADIUS = _env_int("FWS_INSTINCT_RADIUS", 12)
+INSTINCT_RADIUS = _env_int("FWS_INSTINCT_RADIUS", 16)
 
 # =============================================================================
 # 🧩 TENSOR OBSERVATION LAYOUT (STRICT CONTRACT)
@@ -838,7 +838,7 @@ RESPAWN_ENABLED = _env_bool("FWS_RESPAWN", True)
 
 # Minimum population floor per team (hysteresis/fill system may try to maintain this).
 # Env: FWS_RESP_FLOOR_PER_TEAM
-RESP_FLOOR_PER_TEAM      = _env_int("FWS_RESP_FLOOR_PER_TEAM", 190)
+RESP_FLOOR_PER_TEAM      = _env_int("FWS_RESP_FLOOR_PER_TEAM", 100)
 
 # Hard cap of respawns applied per tick.
 # Env: FWS_RESP_MAX_PER_TICK
@@ -966,7 +966,7 @@ if RESPAWN_PARENT_SELECTION_MODE not in ("random", "topk_weighted"):
 
 # Fraction of parent candidates kept in the top-k pool for weighted sampling.
 # Env: FWS_RESP_PARENT_TOPK_FRAC
-RESPAWN_PARENT_SELECTION_TOPK_FRAC: float = _env_float("FWS_RESP_PARENT_TOPK_FRAC", 0.25)
+RESPAWN_PARENT_SELECTION_TOPK_FRAC: float = _env_float("FWS_RESP_PARENT_TOPK_FRAC", 0.05)
 
 # Exponent applied to parent score weights (higher => stronger bias inside top-k).
 # Env: FWS_RESP_PARENT_SCORE_POWER
@@ -1043,7 +1043,7 @@ PPO_PENALTY_DMG_TAKEN_INDIVIDUAL = _env_float("FWS_PPO_PEN_DMG_TAKEN_AGENT", 0.0
 # Individual kill reward for PPO agent signal.
 # Env: FWS_PPO_REW_KILL_AGENT
 # Larger => direct combat success becomes strongly reinforced.
-PPO_REWARD_KILL_INDIVIDUAL = _env_float("FWS_PPO_REW_KILL_AGENT", 20.0)
+PPO_REWARD_KILL_INDIVIDUAL = _env_float("FWS_PPO_REW_KILL_AGENT", 25.0)
 
 # Death penalty for PPO agent signal.
 # Env: FWS_PPO_REW_DEATH
@@ -1053,7 +1053,7 @@ PPO_REWARD_DEATH           = _env_float("FWS_PPO_REW_DEATH", -0.5)
 # Reward for contested CP participation/control signal (implementation-dependent exact condition).
 # Env: FWS_PPO_REW_CONTEST
 # Increasing this pushes policies toward objective zones rather than isolated survival.
-PPO_REWARD_CONTESTED_CP    = _env_float("FWS_PPO_REW_CONTEST", 1.5)
+PPO_REWARD_CONTESTED_CP    = _env_float("FWS_PPO_REW_CONTEST", 2.5)
 
 # =============================================================================
 # 🧠 REINFORCEMENT LEARNING (PROXIMAL POLICY OPTIMIZATION)
@@ -1068,7 +1068,7 @@ PPO_ENABLED       = _env_bool("FWS_PPO_ENABLED", True)
 
 # Reset/log PPO state behavior on startup/resume (runtime-defined exact semantics).
 # Env: FWS_PPO_RESET_LOG
-PPO_RESET_LOG     = _env_bool("FWS_PPO_RESET_LOG", True)
+PPO_RESET_LOG     = _env_bool("FWS_PPO_RESET_LOG", False)
 
 # PPO rollout window length in ticks (trajectory horizon before update).
 # Env: FWS_PPO_TICKS
@@ -1209,12 +1209,12 @@ TEAM_BRAIN_MIX_SEED: int = _env_int("FWS_TEAM_BRAIN_MIX_SEED", int(globals().get
 # Env: FWS_TRON_DMODEL
 # Must be divisible by TRON_HEADS.
 # Larger => more capacity, more compute and memory.
-TRON_D_MODEL       = _env_int("FWS_TRON_DMODEL", 16)
+TRON_D_MODEL       = _env_int("FWS_TRON_DMODEL", 8)
 
 # Number of attention heads.
 # Env: FWS_TRON_HEADS
 # More heads can improve representational diversity but adds overhead.
-TRON_HEADS         = _env_int("FWS_TRON_HEADS", 4)
+TRON_HEADS         = _env_int("FWS_TRON_HEADS", 2)
 
 # Dropout rate in Tron model.
 # Env: FWS_TRON_DROPOUT
@@ -1235,7 +1235,7 @@ TRON_FUSION_LAYERS = _env_int("FWS_TRON_FUSION_LAYERS", 2)
 
 # Hidden width of Tron MLP heads.
 # Env: FWS_TRON_MLP_HID
-TRON_MLP_HIDDEN    = _env_int("FWS_TRON_MLP_HID", 256)
+TRON_MLP_HIDDEN    = _env_int("FWS_TRON_MLP_HID", 128)
 
 # Whether to use RoPE (rotary positional encoding), if implemented by Tron brain.
 # Env: FWS_TRON_ROPE
@@ -1296,7 +1296,7 @@ MIRROR_USE_PRENORM   = _env_bool("FWS_MIRROR_PRENORM", bool(TRON_USE_PRENORM))
 # UI enable flag.
 # Env: FWS_UI
 # True by default here (UI-on). Set False for headless speed / training throughput.
-ENABLE_UI  = _env_bool("FWS_UI", False)
+ENABLE_UI  = _env_bool("FWS_UI", True)
 
 # Explicit inspector mode selector (no-output viewer mode).
 # Values:

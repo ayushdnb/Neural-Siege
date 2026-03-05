@@ -60,8 +60,8 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from .. import config
-from ..engine.agent_registry import AgentsRegistry
+import config
+from engine.agent_registry import AgentsRegistry
 
 
 # ----------------------------------------------------------------------
