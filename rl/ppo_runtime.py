@@ -434,30 +434,51 @@ class PerAgentPPORuntime:
         if not bool(action_masks[ar, actions.long()].all().item()):
             raise RuntimeError("[ppo] chosen action is illegal under rollout action_masks")
 
-        # Compute log probabilities of chosen actions under the SAME masked rollout policy
-        # and keep PPO bookkeeping in fp32.
+        # Compute log probabilities of chosen actions under the SAME masked rollout policy (fp32).
         logits_masked = self._mask_logits(logits, action_masks)
         logp_a = F.log_softmax(logits_masked.to(torch.float32), dim=-1).gather(1, actions.view(-1, 1)).squeeze(1)
 
+        # --- PERF PATCH A: batch detach/cast before loop ---
+        # Rationale: calling agent_ids[i].item() in a Python loop creates N individual
+        # GPU→CPU sync points per tick (one per agent). Similarly, per-element .detach()
+        # and .to() calls inside a loop launch one tiny kernel per agent per field.
+        # By batch-casting all tensors once before the loop we reduce:
+        #   • GPU syncs:      N .item() → 1 .tolist()
+        #   • Cast kernels:   7×N → 7 batch ops + N slice reads (no cast)
+        # Stored data and concatenation semantics are identical.
+        obs_d    = obs.detach()                                          # (B, obs_dim)
+        acts_d   = actions.detach()                                      # (B,)
+        logp_f32 = logp_a.detach().to(torch.float32)                     # (B,)
+        vals_f32 = values.detach().reshape(-1).to(torch.float32)         # (B,)
+        rews_f32 = rewards.detach().to(torch.float32)                    # (B,)
+        done_b   = done.detach().to(torch.bool)                          # (B,)
+        masks_b  = action_masks.detach().to(torch.bool)                  # (B, act_dim)
+        bs_f32   = (bootstrap_values.detach().to(torch.float32)
+                    if bootstrap_values is not None else None)            # (B,) or None
+
+        # Single .tolist() → one GPU→CPU transfer for all agent IDs.
+        aids_list = agent_ids.tolist()
+
         # Append each agent transition into its own buffer.
-        for i in range(agent_ids.numel()):
-            aid = int(agent_ids[i].item())
+        for i, aid in enumerate(aids_list):
+            aid = int(aid)
             b = self._get_buf(aid)
 
-            b.obs.append(obs[i])
-            b.act.append(actions[i].detach())
-            b.logp.append(logp_a[i].detach().to(torch.float32))
+            b.obs.append(obs_d[i])
+            b.act.append(acts_d[i])
+            b.logp.append(logp_f32[i])
 
-            # Ensure value is stored as a (1,) tensor for consistent concatenation later.
-            b.val.append(values[i].detach().reshape(1).to(torch.float32))
+            # unsqueeze(0) gives (1,) shape — same as the old reshape(1) but avoids
+            # a copy; slicing a float32 tensor after batch cast is already correct dtype.
+            b.val.append(vals_f32[i].unsqueeze(0))
 
-            b.rew.append(rewards[i].detach().to(torch.float32))
-            b.done.append(done[i].detach().to(torch.bool))
-            b.act_mask.append(action_masks[i].detach().to(torch.bool))
+            b.rew.append(rews_f32[i])
+            b.done.append(done_b[i])
+            b.act_mask.append(masks_b[i])
 
             # Store bootstrap V(s_{t+1}) if provided.
-            if bootstrap_values is not None:
-                b.bootstrap = bootstrap_values[i].detach().reshape(1).to(torch.float32)
+            if bs_f32 is not None:
+                b.bootstrap = bs_f32[i].reshape(1)
 
         # Advance global step.
         self._step += 1

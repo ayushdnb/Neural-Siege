@@ -10,7 +10,15 @@ from __future__ import annotations
 # Importantly, this changes only annotation evaluation behavior; it does not
 # modify runtime tensor computations or model execution.
 from __future__ import annotations
-
+import weakref
+# --- PERF PATCH C: module-level brain signature cache ---
+# Rationale: _signature() is called for every alive agent every tick. It traverses
+# model.named_modules() and joins strings. Architecture never changes between ticks.
+#
+# WeakKeyDictionary is lifecycle-safe: when a brain module is replaced in register()
+# and the old reference is GC'd, its cache entry automatically vanishes.
+# No manual invalidation is needed — brain identity changes on replacement.
+_BRAIN_SIG_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # ──────────────────────────────────────────────────────────────────────────────
 # Standard library imports
 # ──────────────────────────────────────────────────────────────────────────────
@@ -148,6 +156,9 @@ class Bucket:
     # models: list of nn.Module objects corresponding to those indices, in the
     # same order. The list length is K, matching indices.
     models: List[nn.Module]
+    # locs[j] == position of indices[j] within alive_idx, so alive_idx[locs] == indices.
+    # This eliminates torch.searchsorted in the caller (tick.py) each tick.
+    locs: torch.Tensor      # shape (K,), dtype long
 
 
 class AgentsRegistry:
@@ -547,6 +558,9 @@ class AgentsRegistry:
           • modules are exotic or dynamically defined
           • any attribute access fails
         """
+        cached = _BRAIN_SIG_CACHE.get(model)
+        if cached is not None:
+            return cached
         sig_parts: List[str] = [model.__class__.__name__]
         try:
             for _, m in model.named_modules():
@@ -556,7 +570,12 @@ class AgentsRegistry:
             # If anything goes wrong, fall back to the class name only.
             # This still provides a coarse grouping.
             pass
-        return "|".join(sig_parts)
+        result = "|".join(sig_parts)
+        try:
+            _BRAIN_SIG_CACHE[model] = result
+        except TypeError:
+            pass  # non-weakly-referenceable objects (TorchScript) fall through gracefully
+        return result
 
     def build_buckets(self, alive_idx: torch.Tensor) -> List[Bucket]:
         """
@@ -600,12 +619,13 @@ class AgentsRegistry:
         to 0.0. This indicates that the registry treats "missing brain" as an
         invalid agent state and resolves it by killing the agent.
         """
-        buckets_dict: Dict[str, List[int]] = {}
+        # Each entry is (local_pos_in_alive_idx, global_slot_id).
+        buckets_dict: Dict[str, List] = {}
 
         # Iterate over agent indices. alive_idx.tolist() materializes data to CPU
         # and creates a Python list; this is fine when the number of alive agents
         # is not enormous, but it is a deliberate trade-off for simplicity.
-        for i in alive_idx.tolist():
+        for local_pos, i in enumerate(alive_idx.tolist()):
             brain = self.brains[i]
 
             # If brain is missing, declare the agent dead as a consistency fix.
@@ -615,28 +635,27 @@ class AgentsRegistry:
 
             # Compute signature key and append slot index into bucket dictionary.
             key = self._signature(brain)
-            buckets_dict.setdefault(key, []).append(i)
+            buckets_dict.setdefault(key, []).append((local_pos, i))
 
         out: List[Bucket] = []
 
         # Construct Bucket objects from the dictionary.
         for key, lst in buckets_dict.items():
             # Convert slot list into a LongTensor on the registry device.
-            idx = torch.tensor(lst, dtype=torch.long, device=self.device)
+            locs_list  = [lp for lp, _  in lst]
+            slots_list = [gs for _,  gs in lst]
 
-            # Retrieve models in the same slot order, while defensively checking:
-            #   • index is in bounds
-            #   • brain is not None
-            #
-            # This ensures the Bucket.models list is valid and usable.
+            idx  = torch.tensor(slots_list, dtype=torch.long, device=self.device)
+            locs = torch.tensor(locs_list,  dtype=torch.long, device=self.device)
+
             models = [
                 self.brains[j]
-                for j in lst
+                for j in slots_list
                 if j < len(self.brains) and self.brains[j] is not None
             ]
 
             # Only append non-empty buckets.
             if models:
-                out.append(Bucket(signature=key, indices=idx, models=models))
+                out.append(Bucket(signature=key, indices=idx, models=models, locs=locs))
 
         return out

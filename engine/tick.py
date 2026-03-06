@@ -243,6 +243,17 @@ class TickEngine:
         # - registry data dtype (often float32/float16)
         self._grid_dt = self.grid.dtype
         self._data_dt = self.registry.agent_data.dtype
+        # --- PERF PATCH B: preallocated movement conflict buffers ---
+        # Rationale: run_tick() creates 4 fresh GPU tensors (zeros/full, H×W) every tick
+        # inside the movement hot path. Preallocating once and using .zero_()/.fill_()
+        # in-place eliminates the per-tick allocator overhead.
+        _nc = self.H * self.W
+        self._move_claim_cnt = torch.zeros(_nc, device=self.device, dtype=torch.int32)
+        self._move_max_hp    = torch.zeros(_nc, device=self.device, dtype=self.registry.agent_data.dtype)
+        self._move_max_cnt   = torch.zeros(_nc, device=self.device, dtype=torch.int32)
+        self._move_win_cnt   = torch.zeros(_nc, device=self.device, dtype=torch.int32)
+        # Cached scalar constant used in movement occupancy check.
+        self._g_wall = torch.tensor(1.0, device=self.device, dtype=self._grid_dt)
 
         # ================================================================
         # Instinct cache (computed under no_grad)
@@ -761,20 +772,8 @@ class TickEngine:
                 # |= accumulates: if any CP mask is True at that cell, on_cp becomes True.
                 on_cp |= cp_mask[pos_xy[:, 1], pos_xy[:, 0]]
 
-        def _norm_const(v: float, scale: float) -> torch.Tensor:
-            """
-            Normalize a scalar constant into a per-agent vector.
-
-            Neural networks train more stably when inputs are within reasonable ranges,
-            often near [-1,1] or [0,1]. For large numbers (like tick=50,000),
-            raw input can destabilize gradients and learning dynamics.
-
-            So we normalize by a fixed scale factor.
-            """
-            s = scale if scale > 0 else 1.0
-            return torch.full((N,), v / s, dtype=self._data_dt, device=self.device)
-
         expected_ray_dim = 32 * 8
+        alive_data = data[alive_idx]
 
         # unit_map is a grid-shaped tensor encoding which unit type occupies each cell.
         unit_map = build_unit_map(data, self.grid)
@@ -782,7 +781,7 @@ class TickEngine:
         # Raycasting: 32 rays, “first hit” info, bounded by vision range per agent.
         rays = raycast32_firsthit(
             pos_xy, self.grid, unit_map,
-            max_steps_each=data[alive_idx, COL_VISION].long()
+            max_steps_each=alive_data[:, COL_VISION].long()
         )
         if rays.shape != (N, expected_ray_dim):
             raise RuntimeError(
@@ -791,7 +790,7 @@ class TickEngine:
             )
 
         # hp_max clamped to avoid division-by-zero.
-        hp_max = data[alive_idx, COL_HP_MAX].clamp_min(1.0)
+        hp_max = alive_data[:, COL_HP_MAX].clamp_min(1.0)
 
         # Rich features:
         # - normalized HP (hp/hp_max)
@@ -801,29 +800,31 @@ class TickEngine:
         # - zone flags
         # - normalized global stats
         #
-        # NOTE: Several torch.zeros paddings are used to maintain exact OBS_DIM layout.
-        rich_base = torch.stack([
-            data[alive_idx, COL_HP] / hp_max,
-            data[alive_idx, COL_X] / (self.W - 1),
-            data[alive_idx, COL_Y] / (self.H - 1),
-            (data[alive_idx, COL_TEAM] == 2.0),
-            (data[alive_idx, COL_TEAM] == 3.0),
-            (data[alive_idx, COL_UNIT] == 1.0),
-            (data[alive_idx, COL_UNIT] == 2.0),
-            data[alive_idx, COL_ATK] / (config.MAX_ATK or 1.0),
-            data[alive_idx, COL_VISION] / (config.RAYCAST_MAX_STEPS or 15.0),
-            on_heal.to(self._data_dt),
-            on_cp.to(self._data_dt),
-            _norm_const(float(self.stats.tick), 50000.0),
-            _norm_const(self.stats.red.score, 1000.0), _norm_const(self.stats.blue.score, 1000.0),
-            _norm_const(self.stats.red.cp_points, 500.0), _norm_const(self.stats.blue.cp_points, 500.0),
-            _norm_const(self.stats.red.kills, 500.0), _norm_const(self.stats.blue.kills, 500.0),
-            _norm_const(self.stats.red.deaths, 500.0), _norm_const(self.stats.blue.deaths, 500.0),
-            # Padding slots keep the layout exactly matching the required dimension sizes.
-            torch.zeros(N, device=self.device, dtype=self._data_dt),
-            torch.zeros(N, device=self.device, dtype=self._data_dt),
-            torch.zeros(N, device=self.device, dtype=self._data_dt),
-        ], dim=1).to(dtype=self._data_dt)
+        # Build the exact same 23-column layout, but write directly into a single
+        # preallocated tensor to avoid many temporary (N,) vectors each tick.
+        rich_base = torch.empty((N, 23), device=self.device, dtype=self._data_dt)
+        rich_base[:, 0] = alive_data[:, COL_HP] / hp_max
+        rich_base[:, 1] = alive_data[:, COL_X] / (self.W - 1)
+        rich_base[:, 2] = alive_data[:, COL_Y] / (self.H - 1)
+        rich_base[:, 3] = (alive_data[:, COL_TEAM] == 2.0).to(self._data_dt)
+        rich_base[:, 4] = (alive_data[:, COL_TEAM] == 3.0).to(self._data_dt)
+        rich_base[:, 5] = (alive_data[:, COL_UNIT] == 1.0).to(self._data_dt)
+        rich_base[:, 6] = (alive_data[:, COL_UNIT] == 2.0).to(self._data_dt)
+        rich_base[:, 7] = alive_data[:, COL_ATK] / (config.MAX_ATK or 1.0)
+        rich_base[:, 8] = alive_data[:, COL_VISION] / (config.RAYCAST_MAX_STEPS or 15.0)
+        rich_base[:, 9] = on_heal.to(self._data_dt)
+        rich_base[:, 10] = on_cp.to(self._data_dt)
+        rich_base[:, 11].fill_(float(self.stats.tick) / 50000.0)
+        rich_base[:, 12].fill_(float(self.stats.red.score) / 1000.0)
+        rich_base[:, 13].fill_(float(self.stats.blue.score) / 1000.0)
+        rich_base[:, 14].fill_(float(self.stats.red.cp_points) / 500.0)
+        rich_base[:, 15].fill_(float(self.stats.blue.cp_points) / 500.0)
+        rich_base[:, 16].fill_(float(self.stats.red.kills) / 500.0)
+        rich_base[:, 17].fill_(float(self.stats.blue.kills) / 500.0)
+        rich_base[:, 18].fill_(float(self.stats.red.deaths) / 500.0)
+        rich_base[:, 19].fill_(float(self.stats.blue.deaths) / 500.0)
+        # Padding slots keep the layout exactly matching the required dimension sizes.
+        rich_base[:, 20:].zero_()
 
         instinct = self._compute_instinct_context(alive_idx=alive_idx, pos_xy=pos_xy, unit_map=unit_map)
         if instinct.shape != (N, 4):
@@ -989,15 +990,19 @@ class TickEngine:
         # ---------------------------------------------------------------------
         # Agents can have different models/brains. We group them into buckets to run
         # ensemble_forward efficiently per model type.
+        neg_inf = torch.finfo(torch.float32).min
         for bucket in self.registry.build_buckets(alive_idx):
             # loc are positions of bucket.indices within alive_idx (sorted alignment assumed)
-            loc = torch.searchsorted(alive_idx, bucket.indices)
+            # PERF PATCH D: locs are precomputed in build_buckets; no searchsorted needed.
+            loc = bucket.locs
+            bucket_obs = obs[loc]
+            bucket_mask = mask[loc]
 
             # Forward pass: returns distribution (dist) and value estimate (vals)
-            dist, vals = ensemble_forward(bucket.models, obs[loc])
+            dist, vals = ensemble_forward(bucket.models, bucket_obs)
 
             # Mask logits: illegal actions get very negative logits (approx -inf)
-            logits32 = torch.where(mask[loc], dist.logits, torch.finfo(torch.float32).min).to(torch.float32)
+            logits32 = torch.where(bucket_mask, dist.logits.to(torch.float32), neg_inf)
 
             # Sample action from categorical distribution
             a = torch.distributions.Categorical(logits=logits32).sample()
@@ -1005,11 +1010,11 @@ class TickEngine:
             if self._ppo:
                 # Store trajectory elements needed for PPO training
                 rec_agent_ids.append(bucket.indices)
-                rec_obs.append(obs[loc])
+                rec_obs.append(bucket_obs)
                 rec_logits.append(logits32)
                 rec_values.append(vals)
                 rec_actions.append(a)
-                rec_action_masks.append(mask[loc])
+                rec_action_masks.append(bucket_mask)
                 rec_teams.append(data[bucket.indices, COL_TEAM])
 
             actions[loc] = a
@@ -1405,7 +1410,7 @@ class TickEngine:
             # Destination occupancy code (grid channel 0):
             #   0.0 empty | 1.0 wall | 2.0 red | 3.0 blue
             occ_all = self.grid[0][ny_all, nx_all]
-            g_wall = (self._g0 + 1.0)
+            g_wall = self._g_wall
 
             # Destination must be empty to be eligible for movement
             can_move_all = (occ_all == self._g0)
@@ -1442,18 +1447,18 @@ class TickEngine:
                 hp = data[move_idx, COL_HP]                   # hp used to decide winners
 
                 # Per-destination claimant count (works even if scatter_reduce_ is unavailable)
-                num_cells = int(self.H * self.W)
-                claim_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                num_cells = self.H * self.W
+                claim_cnt = self._move_claim_cnt.zero_()
                 claim_cnt.scatter_add_(0, dest_key, torch.ones_like(dest_key, dtype=torch.int32))
 
                 try:
-                    # scatter_reduce_ (amax) finds per-cell maximum HP among claimants.
-                    max_hp = torch.full((num_cells,), torch.finfo(hp.dtype).min, device=self.device, dtype=hp.dtype)
+                    # PERF PATCH B: reuse buffer; fill_() is in-place, no alloc.
+                    max_hp = self._move_max_hp.fill_(torch.finfo(hp.dtype).min)
                     max_hp.scatter_reduce_(0, dest_key, hp, reduce="amax", include_self=True)
                     is_max = (hp == max_hp[dest_key])
 
                     # Count how many claimants share the max HP (tie detection).
-                    max_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                    max_cnt = self._move_max_cnt.zero_()
                     max_cnt.scatter_add_(0, dest_key, is_max.to(torch.int32))
 
                     winner_mask = is_max & (max_cnt[dest_key] == 1)
@@ -1479,7 +1484,7 @@ class TickEngine:
                                 winner_mask[order[win_off]] = True
 
                 # Classify conflict outcomes (used for aggregates + optional per-agent move events)
-                win_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                win_cnt = self._move_win_cnt.zero_()
                 win_cnt.scatter_add_(0, dest_key, winner_mask.to(torch.int32))
 
                 conflict_mask = (claim_cnt[dest_key] > 1)
@@ -1788,7 +1793,7 @@ class TickEngine:
                     obs_post = self._build_transformer_obs(post_step_slot_ids, pos_xy_post)
 
                     for bucket in self.registry.build_buckets(post_step_slot_ids):
-                        loc = torch.searchsorted(post_step_slot_ids, bucket.indices)
+                        loc = bucket.locs
                         _, vals = ensemble_forward(bucket.models, obs_post[loc])
                         bootstrap_values[alive_pos[loc]] = vals.to(torch.float32)
 

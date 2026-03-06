@@ -320,13 +320,14 @@ class MirrorBrain(nn.Module):
 
         # These keys must match what obs_spec.build_semantic_tokens produces.
         sem_keys = ["own_context", "world_context", "zone_context", "team_context", "combat_context"]
+        self._sem_keys = tuple(sem_keys)
 
         # The mapping config.SEMANTIC_RICH_BASE_INDICES is expected to contain:
         #   key -> list of indices in rich_base corresponding to that semantic token.
         #
         # This enforces a stable, explicit schema for structured features.
         sem_idx_map: Dict[str, List[int]] = dict(getattr(config, "SEMANTIC_RICH_BASE_INDICES", {}))
-        for k in sem_keys:
+        for k in self._sem_keys:
             idxs = sem_idx_map.get(k, None)
             if idxs is None or len(idxs) == 0:
                 raise RuntimeError(f"[MirrorBrain] Missing/empty semantic index list for '{k}' in SEMANTIC_RICH_BASE_INDICES.")
@@ -640,7 +641,7 @@ class MirrorBrain(nn.Module):
         ray_tok = self._embed_rays(rays_raw)
 
         # Add learnable direction embedding (a learned per-ray positional encoding).
-        ray_tok = ray_tok + self.ray_dir_embed.to(device=obs.device, dtype=ray_tok.dtype)
+        ray_tok = ray_tok + self.ray_dir_embed.to(dtype=ray_tok.dtype)
 
         # Encode rays using stacked self-attention blocks.
         for blk in self.ray_encoder:
@@ -651,11 +652,7 @@ class MirrorBrain(nn.Module):
         sem_raw = obs_spec.build_semantic_tokens(rich_base, instinct)
 
         # Embed five semantic tokens, each becoming one token in model space.
-        sem_keys = ["own_context", "world_context", "zone_context", "team_context", "combat_context"]
-        sem_tokens = []
-        for k in sem_keys:
-            sem_tokens.append(self._embed_sem(sem_raw[k], k).unsqueeze(1))
-        sem = torch.cat(sem_tokens, dim=1)  # (B,5,D)
+        sem = torch.stack([self._embed_sem(sem_raw[k], k) for k in self._sem_keys], dim=1)  # (B,5,D)
 
         # Embed instinct context as one token.
         inst_tok = self._embed_instinct(sem_raw["instinct_context"]).unsqueeze(1)  # (B,1,D)
@@ -663,8 +660,8 @@ class MirrorBrain(nn.Module):
         # Expand learnable decision and memory tokens across the batch.
         # - expand does not allocate new memory for each batch element (broadcast view).
         # - .to(device=obs.device) ensures parameters reside on correct device at runtime.
-        dec = self.decision_tokens.expand(B, -1, -1).to(device=obs.device)  # (B,3,D)
-        mem = self.memory_token.expand(B, -1, -1).to(device=obs.device)     # (B,1,D)
+        dec = self.decision_tokens.expand(B, -1, -1)  # (B,3,D)
+        mem = self.memory_token.expand(B, -1, -1)     # (B,1,D)
 
         # Plan token sequence: (3 decision + 5 semantic + 1 instinct + 1 memory = 10 tokens)
         tok = torch.cat([dec, sem, inst_tok, mem], dim=1)  # (B,10,D)
@@ -697,7 +694,7 @@ class MirrorBrain(nn.Module):
         # ================================================================
 
         # Build reflection token from internal state only.
-        ref = self._build_ref_token(tok[:, :3, :], logits_prop, value_prop).to(dtype=tok.dtype, device=tok.device)  # (B,1,D)
+        ref = self._build_ref_token(tok[:, :3, :], logits_prop, value_prop).to(dtype=tok.dtype)  # (B,1,D)
 
         # Reflection attends to plan tokens then rays.
         # This allows the reflection state to consider:

@@ -114,39 +114,48 @@ def _ensemble_forward_loop(models: List[nn.Module], obs: torch.Tensor) -> Tuple[
     if K == 0:
         return _DistWrap(logits=torch.empty((0, 0), device=device)), torch.empty((0,), device=device)
 
-    logits_out: List[torch.Tensor] = []
-    values_out: List[torch.Tensor] = []
+    # Run the first model to determine output shapes/dtypes, then write all
+    # subsequent outputs directly into preallocated tensors.
+    first_out = models[0](obs[0].unsqueeze(0))
+    if not (isinstance(first_out, tuple) and len(first_out) == 2):
+        raise RuntimeError("Brain.forward must return (logits_or_dist, value)")
 
-    # Iterate over each model/agent in the bucket.
-    for i, model in enumerate(models):
-        # obs[i] has shape (F,). The model expects (batch, F), so we add a batch dimension.
-        o = obs[i].unsqueeze(0)  # (1,F)
+    first_head, first_val = first_out
+    first_logits = first_head.logits if hasattr(first_head, "logits") else first_head  # (1,A)
+    first_v = first_val.view(-1)  # (1,)
 
-        # Forward pass. Contract: model(o) -> (head, val)
-        out = model(o)
+    if first_logits.dim() != 2 or first_logits.size(0) != 1:
+        raise RuntimeError(f"ensemble_forward loop: per-model logits shape invalid: got {tuple(first_logits.shape)}")
+    if first_v.numel() != 1:
+        raise RuntimeError(f"ensemble_forward loop: per-model value shape invalid: got {tuple(first_v.shape)}")
 
-        # Validate contract: must be a 2-tuple.
+    logits_cat = torch.empty(
+        (K, int(first_logits.size(1))),
+        device=first_logits.device,
+        dtype=first_logits.dtype,
+    )
+    values_cat = torch.empty((K,), device=first_v.device, dtype=first_v.dtype)
+
+    logits_cat[0].copy_(first_logits.squeeze(0))
+    values_cat[0] = first_v[0]
+
+    # Iterate over remaining models/agents in the bucket.
+    for i, model in enumerate(models[1:], start=1):
+        out = model(obs[i].unsqueeze(0))
         if not (isinstance(out, tuple) and len(out) == 2):
             raise RuntimeError("Brain.forward must return (logits_or_dist, value)")
 
         head, val = out
-
-        # Some policies return a distribution object with `.logits`.
-        # Others return logits tensor directly. Support both.
         logits = head.logits if hasattr(head, "logits") else head  # (1,A)
-
-        # Value head may have shape (1,1), (1,), etc.
-        # We standardize it to a 1D tensor of length 1 via view(-1).
         v = val.view(-1)  # (1,)
 
-        logits_out.append(logits)
-        values_out.append(v)
+        if logits.dim() != 2 or logits.size(0) != 1:
+            raise RuntimeError(f"ensemble_forward loop: per-model logits shape invalid: got {tuple(logits.shape)}")
+        if v.numel() != 1:
+            raise RuntimeError(f"ensemble_forward loop: per-model value shape invalid: got {tuple(v.shape)}")
 
-    # Concatenate across agents to produce batched outputs:
-    # - logits: (K, A)
-    # - values: (K,)
-    logits_cat = torch.cat(logits_out, dim=0)  # (K,A)
-    values_cat = torch.cat(values_out, dim=0)  # (K,)
+        logits_cat[i].copy_(logits.squeeze(0))
+        values_cat[i] = v[0]
 
     # Ensure values never become 0-dim (scalar tensor).
     # This is defensive: some edge cases can cause shape collapsing.
