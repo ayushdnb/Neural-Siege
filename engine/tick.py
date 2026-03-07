@@ -1030,6 +1030,11 @@ class TickEngine:
 
         # If absolutely everyone is dead, fast-forward time and respawn.
         if alive_idx.numel() == 0:
+            # If the previous tick ended a PPO window, there are no surviving slots left
+            # to bootstrap here, so the pending boundary can be finalized immediately.
+            if self._ppo is not None:
+                self._ppo.finalize_pending_window_from_cache()
+
             self.stats.on_tick_advanced(1)
             metrics.tick = int(self.stats.tick)
 
@@ -1143,6 +1148,19 @@ class TickEngine:
                     raise RuntimeError(
                         f"[tick] chosen action is masked out (first_bad_local_idx={bad}, use FWS_DEBUG_FORCE_ACTIONS to reproduce)"
                     )
+
+        # Update the persistent PPO value cache from the normal main inference pass.
+        # This removes the need for a second post-step observation/inference branch
+        # just to supply bootstrap values at PPO window boundaries.
+        if self._ppo and rec_agent_ids:
+            self._ppo.update_value_cache(
+                agent_ids=torch.cat(rec_agent_ids),
+                values=torch.cat(rec_values),
+            )
+
+            # If the previous tick ended a PPO window without an explicit bootstrap,
+            # finalize it now using the cached V(s_t) from this tick's normal forward.
+            self._ppo.finalize_pending_window_from_cache()
 
         metrics.alive = int(alive_idx.numel())
 
@@ -1949,34 +1967,15 @@ class TickEngine:
                     except Exception:
                         pass
 
-            # Bootstrapping values for next state if training next step
+            # PPO window bootstrap now comes from the persistent slot-local value cache.
             #
-            # NOTE (PPO/GAE semantics):
-            # bootstrap_values here are V(s_{t+1}) for surviving slots, so they are computed
-            # from POST-resolution observations (after combat/move/env in this tick).
-            # This is expected behavior for standard actor-critic bootstrapping.
-            bootstrap_values = None
-            if self._ppo.will_train_next_step():
-                alive_mask = (data[ppo_slot_ids, COL_ALIVE] > 0.5)
-                bootstrap_values = torch.zeros((ppo_slot_ids.numel(),), device=ppo_slot_ids.device, dtype=torch.float32)
-                if alive_mask.any():
-                    alive_pos = alive_mask.nonzero(as_tuple=False).squeeze(1)
-                    post_step_slot_ids = ppo_slot_ids[alive_pos]
-
-                    order = torch.argsort(post_step_slot_ids)
-                    post_step_slot_ids = post_step_slot_ids[order]
-                    alive_pos = alive_pos[order]
-
-                    pos_xy_post = self.registry.positions_xy(post_step_slot_ids)
-                    obs_post = self._build_transformer_obs(post_step_slot_ids, pos_xy_post)
-
-                    for bucket in self.registry.build_buckets(post_step_slot_ids):
-                        loc = bucket.locs
-                        _, vals = ensemble_forward(bucket.models, obs_post[loc])
-                        bootstrap_values[alive_pos[loc]] = vals.to(torch.float32)
-
-            # PPO needs gradients to update the policy/value networks.
-            # The rest of the tick uses no_grad for speed.
+            # On the final step of a window, record_step() stages the boundary batch.
+            # The next tick's *normal* main inference pass updates the cache with V(s_{t+1})
+            # for the surviving slots, and finalize_pending_window_from_cache() consumes it.
+            #
+            # This removes the old duplicate post-step:
+            #   positions_xy -> _build_transformer_obs -> build_buckets -> ensemble_forward
+            # bootstrap-only pass from the hot path.
             with torch.enable_grad():
                 self._ppo.record_step(
                     agent_ids=ppo_slot_ids,
@@ -1987,7 +1986,7 @@ class TickEngine:
                     rewards=final_rewards,
                     done=(data[ppo_slot_ids, COL_ALIVE] <= 0.5),
                     action_masks=torch.cat(rec_action_masks),
-                    bootstrap_values=bootstrap_values,
+                    bootstrap_values=None,
                 )
 
         # ---------------------------------------------------------------------
@@ -2036,4 +2035,5 @@ class TickEngine:
 
         # Return metrics as a dict
         return vars(metrics)
+
 

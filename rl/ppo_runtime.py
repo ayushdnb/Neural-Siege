@@ -188,6 +188,22 @@ class PerAgentPPORuntime:
         self._sched: Dict[int, CosineAnnealingLR] = {}
         self._step = 0
 
+        # Slot-local value cache used to bootstrap PPO window boundaries without
+        # a second post-step observation/inference pass. Semantics:
+        # - cache[slot] stores the most recent value estimate V(s_t) produced by the
+        #   *normal* main inference path for that slot
+        # - valid[slot] tells us whether that cache line belongs to the current slot occupant
+        # - pending window state remembers which slots need V(s_{t+1}) on the next tick
+        #
+        # IMPORTANT:
+        # - This remains strictly slot-local (no sharing / no mixing across slots).
+        # - reset/flush paths explicitly invalidate reused/dead slots.
+        cap = int(self.registry.capacity)
+        self._value_cache = torch.zeros((cap,), device=self.device, dtype=torch.float32)
+        self._value_cache_valid = torch.zeros((cap,), device=self.device, dtype=torch.bool)
+        self._pending_window_agent_ids: Optional[torch.Tensor] = None
+        self._pending_window_done: Optional[torch.Tensor] = None
+
         # Additive telemetry cache (read-only to external observers).
         # Updated only after successful train/update work.
         self.last_train_summary: Optional[Dict[str, float]] = None
@@ -322,6 +338,11 @@ class PerAgentPPORuntime:
         self._sched.pop(int(aid), None)
         self._opt.pop(int(aid), None)
         self._buf.pop(int(aid), None)
+        self.invalidate_value_cache([int(aid)])
+
+        # If a pending boundary still references this slot, keep the pending metadata
+        # intact; finalize_pending_window_from_cache() will ignore the slot if its
+        # buffer was already cleared (e.g. terminal flush before respawn).
 
     def reset_agents(self, aids: torch.Tensor | List[int]) -> None:
         """
@@ -345,6 +366,128 @@ class PerAgentPPORuntime:
 
         for a in lst:
             self.reset_agent(int(a))
+
+    def update_value_cache(self, agent_ids: torch.Tensor, values: torch.Tensor) -> None:
+        """
+        Update the persistent slot-local value cache from the normal main inference pass.
+
+        Inputs:
+        - agent_ids: (B,) registry slot indices aligned with `values`
+        - values:    (B,) or (B,1) critic outputs V(s_t) for those slots
+
+        This method is intentionally lightweight:
+        - one batched fp32 cast
+        - one indexed write into the cache
+        - no cross-slot aggregation or mixing
+        """
+        if agent_ids is None or agent_ids.numel() == 0:
+            return
+        if agent_ids.device != self.device:
+            raise RuntimeError(
+                f"[ppo] value-cache agent_ids device mismatch: got {agent_ids.device}, expected {self.device}"
+            )
+        if values.device != self.device:
+            raise RuntimeError(
+                f"[ppo] value-cache values device mismatch: got {values.device}, expected {self.device}"
+            )
+        if agent_ids.dim() != 1:
+            raise RuntimeError(f"[ppo] value-cache agent_ids must be (B,), got {tuple(agent_ids.shape)}")
+
+        vals_f32 = values.detach().reshape(-1).to(torch.float32)
+        if vals_f32.numel() != int(agent_ids.numel()):
+            raise RuntimeError(
+                f"[ppo] value-cache values length mismatch: ids={int(agent_ids.numel())} values={int(vals_f32.numel())}"
+            )
+
+        slot_ids = agent_ids.detach().to(torch.long)
+        self._value_cache[slot_ids] = vals_f32
+        self._value_cache_valid[slot_ids] = True
+
+    def invalidate_value_cache(self, agent_ids: Any) -> None:
+        """
+        Invalidate cached values for the specified slots.
+
+        This is called on slot flush/reset paths so reused slots never inherit a
+        stale cached value from a previous occupant.
+        """
+        if agent_ids is None:
+            return
+
+        if isinstance(agent_ids, torch.Tensor):
+            if agent_ids.numel() == 0:
+                return
+            slot_ids = agent_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+        else:
+            ids_list = [int(a) for a in agent_ids]
+            if len(ids_list) == 0:
+                return
+            slot_ids = torch.tensor(ids_list, device=self.device, dtype=torch.long)
+
+        self._value_cache_valid[slot_ids] = False
+        self._value_cache[slot_ids] = 0.0
+
+    def has_pending_window_bootstrap(self) -> bool:
+        """
+        Return True if the previous boundary step is waiting for cached V(s_{t+1}).
+        """
+        return (
+            self._pending_window_agent_ids is not None and
+            self._pending_window_done is not None
+        )
+
+    def finalize_pending_window_from_cache(self) -> bool:
+        """
+        Complete a deferred window-boundary bootstrap using the persistent value cache.
+
+        Design:
+        - record_step() stages the final boundary batch when it reaches the end of a
+          PPO window without explicit bootstrap_values.
+        - On the next tick, TickEngine updates the cache from the normal main forward
+          pass (current state's V(s_t)).
+        - This method copies those cached slot-local values into the pending buffers
+          as V(s_{t+1}) and then runs the normal train-and-clear path.
+
+        Done slots are intentionally bootstrapped with zero:
+        - their final transition already has done=True, so GAE masks out the bootstrap term
+        - this also prevents stale-cache contamination if the slot gets reused before
+          this method runs
+        """
+        if not self.has_pending_window_bootstrap():
+            return False
+
+        aids = self._pending_window_agent_ids
+        done = self._pending_window_done
+        assert aids is not None and done is not None
+
+        if aids.numel() != done.numel():
+            raise RuntimeError(
+                f"[ppo] pending bootstrap shape mismatch: aids={tuple(aids.shape)} done={tuple(done.shape)}"
+            )
+
+        bootstrap = torch.zeros((int(aids.numel()),), device=self.device, dtype=torch.float32)
+
+        survivors = ~done
+        if survivors.any():
+            survivor_ids = aids[survivors]
+            valid = self._value_cache_valid[survivor_ids]
+            if not bool(valid.all().item()):
+                bad_ids = survivor_ids[~valid][:8].detach().cpu().to(torch.int64).tolist()
+                raise RuntimeError(
+                    "[ppo] missing cached bootstrap values for pending boundary slots: "
+                    f"{bad_ids}"
+                )
+            bootstrap[survivors] = self._value_cache[survivor_ids]
+
+        for i, aid in enumerate(aids.detach().cpu().to(torch.int64).tolist()):
+            b = self._buf.get(int(aid), None)
+            if b is None or len(b.obs) == 0:
+                continue
+            b.bootstrap = bootstrap[i].reshape(1)
+
+        self._pending_window_agent_ids = None
+        self._pending_window_done = None
+        self._train_window_and_clear()
+        return True
 
     # ------------------------------------------------------------------
     # Lazy buffer / optimizer creation
@@ -428,6 +571,12 @@ class PerAgentPPORuntime:
         # Validate shapes/devices early.
         self._assert_record_shapes(agent_ids, obs, logits, values, actions, action_masks=action_masks)
 
+        if self.has_pending_window_bootstrap():
+            raise RuntimeError(
+                "[ppo] pending window bootstrap must be finalized from cached values "
+                "before recording another PPO step"
+            )
+
         if action_masks is None:
             # Backward-compatible fallback for callers not yet passing masks.
             action_masks = torch.ones(
@@ -509,8 +658,21 @@ class PerAgentPPORuntime:
         self._step += 1
 
         # Train if we reached end of window.
+        #
+        # Two supported modes:
+        # 1) Immediate bootstrap path:
+        #    Caller provided explicit bootstrap_values for this boundary step, so
+        #    we can train immediately (legacy / compatibility path).
+        # 2) Cached bootstrap path:
+        #    Caller omitted bootstrap_values at the boundary. We defer training
+        #    until the next tick's normal main forward updates the per-slot cache
+        #    with V(s_{t+1}) for the surviving slots from this batch.
         if self._step % self.T == 0:
-            self._train_window_and_clear()
+            if bs_f32 is not None:
+                self._train_window_and_clear()
+            else:
+                self._pending_window_agent_ids = agent_ids.detach().to(self.device, dtype=torch.long).clone()
+                self._pending_window_done = done_b.detach().to(self.device, dtype=torch.bool).clone()
 
     # ------------------------------------------------------------------
     # Public flush method – train and clear specific agents immediately
@@ -538,6 +700,7 @@ class PerAgentPPORuntime:
             return
 
         self._train_aids_and_clear(aids)
+        self.invalidate_value_cache(aids)
 
     # ------------------------------------------------------------------
     # Core training routine – shared by window flush and manual flush
@@ -1038,6 +1201,10 @@ class PerAgentPPORuntime:
             "buf":   buf_out,
             "opt":   opt_out,
             "sched": sched_out,
+            "value_cache": cpuize(self._value_cache),
+            "value_cache_valid": cpuize(self._value_cache_valid),
+            "pending_window_agent_ids": cpuize(self._pending_window_agent_ids),
+            "pending_window_done": cpuize(self._pending_window_done),
         }
 
     def load_checkpoint_state(
@@ -1076,6 +1243,31 @@ class PerAgentPPORuntime:
         self._step = int(state.get("step", 0))
         self._train_update_seq = int(state.get("train_update_seq", 0))
         self._rich_telemetry_row_seq = int(state.get("rich_telemetry_row_seq", 0))
+
+        # Restore value-cache state. Older checkpoints may not have these keys.
+        cap = int(self.registry.capacity)
+        vc = state.get("value_cache", None)
+        vcv = state.get("value_cache_valid", None)
+        if torch.is_tensor(vc) and int(vc.numel()) == cap:
+            self._value_cache = vc.to(device=dev, dtype=torch.float32).reshape(cap)
+        else:
+            self._value_cache = torch.zeros((cap,), device=dev, dtype=torch.float32)
+
+        if torch.is_tensor(vcv) and int(vcv.numel()) == cap:
+            self._value_cache_valid = vcv.to(device=dev, dtype=torch.bool).reshape(cap)
+        else:
+            self._value_cache_valid = torch.zeros((cap,), device=dev, dtype=torch.bool)
+
+        pwa = state.get("pending_window_agent_ids", None)
+        pwd = state.get("pending_window_done", None)
+        self._pending_window_agent_ids = (
+            pwa.to(device=dev, dtype=torch.long).reshape(-1)
+            if torch.is_tensor(pwa) else None
+        )
+        self._pending_window_done = (
+            pwd.to(device=dev, dtype=torch.bool).reshape(-1)
+            if torch.is_tensor(pwd) else None
+        )
 
         # Restore buffers
         self._buf.clear()
@@ -1262,3 +1454,4 @@ class PerAgentPPORuntime:
         entropy = -(logp.exp() * logp).sum(-1)
 
         return logits, values, entropy
+
