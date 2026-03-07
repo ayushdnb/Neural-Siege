@@ -65,33 +65,36 @@ from engine.agent_registry import AgentsRegistry
 
 
 # ----------------------------------------------------------------------
-# Simple buffer for one agent's trajectory segment
+# Tensor-backed buffer for one agent's trajectory segment
 # ----------------------------------------------------------------------
 @dataclass
 class _Buf:
     """
-    Holds rollout data for a single agent between training windows.
+    Holds rollout data for a single slot between PPO updates.
 
-    Each field is a list of tensors for each timestep in the window.
+    Storage layout:
+    - Each rollout field is a preallocated tensor with leading dimension = capacity.
+    - write_ptr is the number of valid timesteps currently written.
+    - Valid data for training/checkpointing is always the prefix [:write_ptr].
+
+    Why tensor-backed storage exists:
+    - record_step is hot-path code called every simulation tick.
+    - Repeated Python list append creates object churn and later stack/cat overhead.
+    - Fixed contiguous tensors let us do in-place writes while preserving exact
+      per-slot ownership and temporal order.
 
     The 'bootstrap' field stores the value estimate for the state *after* the
     last recorded transition in a window: V(s_{t+1}).
-
-    Why bootstrap exists:
-    - GAE (Generalized Advantage Estimation) needs a "next value" term.
-    - At the end of a rollout window, you may not have stored the next state's
-      value in the buffer.
-    - If you know V(s_{T}) for the state after the last action, you can compute
-      the final advantage correctly without assuming 0.
     """
-    obs: List[torch.Tensor]          # observations (obs_dim,)
-    act: List[torch.Tensor]          # actions taken (scalar)
-    logp: List[torch.Tensor]         # log-probabilities of those actions (scalar, fp32)
-    val: List[torch.Tensor]          # value estimates from the critic (scalar, fp32)
-    rew: List[torch.Tensor]          # rewards received (scalar, fp32)
-    done: List[torch.Tensor]         # done flags (episode end) (bool)
-    act_mask: List[torch.Tensor]     # legal-action mask used during rollout sampling (bool, shape=(act_dim,))
-    bootstrap: Optional[torch.Tensor] = None  # V(s_{t+1}) for the last step of a rollout window
+    obs: Optional[torch.Tensor] = None       # (capacity, obs_dim)
+    act: Optional[torch.Tensor] = None       # (capacity,)
+    logp: Optional[torch.Tensor] = None      # (capacity,) float32
+    val: Optional[torch.Tensor] = None       # (capacity,) float32
+    rew: Optional[torch.Tensor] = None       # (capacity,) float32
+    done: Optional[torch.Tensor] = None      # (capacity,) bool
+    act_mask: Optional[torch.Tensor] = None  # (capacity, act_dim) bool; None only for legacy checkpoints missing masks
+    write_ptr: int = 0                       # number of valid rollout steps currently stored
+    bootstrap: Optional[torch.Tensor] = None # V(s_{t+1}) for the last step of a rollout window
 
 
 # ----------------------------------------------------------------------
@@ -343,12 +346,86 @@ class PerAgentPPORuntime:
         """
         Return rollout buffer for slot `aid`, creating it if missing.
 
-        Buffers store *lists* because data arrives step-by-step.
-        At training time we stack lists into batched tensors.
+        Buffers are tensor-backed and grow only when needed.
+        Valid steps always occupy the prefix [:write_ptr].
         """
         if aid not in self._buf:
-            self._buf[aid] = _Buf([], [], [], [], [], [], [])
+            self._buf[aid] = _Buf()
         return self._buf[aid]
+
+    def _buf_capacity(self, b: _Buf) -> int:
+        """
+        Return current storage capacity (number of time slots) for a buffer.
+        """
+        for t in (b.obs, b.act, b.logp, b.val, b.rew, b.done, b.act_mask):
+            if t is not None:
+                return int(t.size(0))
+        return 0
+
+    def _clear_buf(self, b: _Buf) -> None:
+        """
+        Clear logical contents of a buffer without dropping allocated tensors.
+
+        This preserves preallocated storage for the next rollout window while
+        preventing stale steps from being considered valid.
+        """
+        b.write_ptr = 0
+        b.bootstrap = None
+
+    def _ensure_buf_storage(
+        self,
+        b: _Buf,
+        *,
+        obs_dtype: torch.dtype,
+        act_dtype: torch.dtype,
+        min_capacity: int,
+    ) -> None:
+        """
+        Ensure tensor-backed storage exists and can hold at least `min_capacity` steps.
+
+        Normal steady-state uses capacity=self.T, but this helper also supports:
+        - old checkpoints restored under different PPO_WINDOW_TICKS
+        - rare partial flush / resume edge cases
+        without changing rollout ownership semantics.
+        """
+        min_capacity = max(1, int(min_capacity))
+        old_cap = self._buf_capacity(b)
+
+        if b.act_mask is None and int(b.write_ptr) > 0:
+            raise RuntimeError("[ppo] buffer has valid steps but no act_mask storage (legacy segment must be cleared first)")
+
+        if old_cap <= 0:
+            new_cap = max(int(self.T), min_capacity)
+        elif old_cap < min_capacity:
+            new_cap = max(int(self.T), min_capacity, old_cap * 2)
+        else:
+            new_cap = old_cap
+
+        valid_n = int(b.write_ptr)
+
+        def _resize_1d(old: Optional[torch.Tensor], *, dtype: torch.dtype) -> torch.Tensor:
+            if old is not None and old_cap == new_cap:
+                return old
+            out = torch.empty((new_cap,), device=self.device, dtype=(old.dtype if old is not None else dtype))
+            if old is not None and valid_n > 0:
+                out[:valid_n].copy_(old[:valid_n])
+            return out
+
+        def _resize_2d(old: Optional[torch.Tensor], width: int, *, dtype: torch.dtype) -> torch.Tensor:
+            if old is not None and old_cap == new_cap:
+                return old
+            out = torch.empty((new_cap, width), device=self.device, dtype=(old.dtype if old is not None else dtype))
+            if old is not None and valid_n > 0:
+                out[:valid_n].copy_(old[:valid_n])
+            return out
+
+        b.obs = _resize_2d(b.obs, int(self.obs_dim), dtype=obs_dtype)
+        b.act = _resize_1d(b.act, dtype=act_dtype)
+        b.logp = _resize_1d(b.logp, dtype=torch.float32)
+        b.val = _resize_1d(b.val, dtype=torch.float32)
+        b.rew = _resize_1d(b.rew, dtype=torch.float32)
+        b.done = _resize_1d(b.done, dtype=torch.bool)
+        b.act_mask = _resize_2d(b.act_mask, int(self.act_dim), dtype=torch.bool)
 
     def _get_opt(self, aid: int, model: nn.Module) -> optim.Optimizer:
         """
@@ -459,22 +536,35 @@ class PerAgentPPORuntime:
         # Single .tolist() → one GPU→CPU transfer for all agent IDs.
         aids_list = agent_ids.tolist()
 
-        # Append each agent transition into its own buffer.
+        # Write each agent transition into its own tensor-backed buffer.
         for i, aid in enumerate(aids_list):
             aid = int(aid)
             b = self._get_buf(aid)
 
-            b.obs.append(obs_d[i])
-            b.act.append(acts_d[i])
-            b.logp.append(logp_f32[i])
+            # Legacy checkpoints from before rollout action masks cannot be mixed with
+            # newly collected masked steps. Drop the old segment first, then reuse the slot.
+            if b.act_mask is None and int(b.write_ptr) > 0:
+                self._clear_buf(b)
 
-            # unsqueeze(0) gives (1,) shape — same as the old reshape(1) but avoids
-            # a copy; slicing a float32 tensor after batch cast is already correct dtype.
-            b.val.append(vals_f32[i].unsqueeze(0))
+            write_idx = int(b.write_ptr)
+            self._ensure_buf_storage(
+                b,
+                obs_dtype=obs_d.dtype,
+                act_dtype=acts_d.dtype,
+                min_capacity=write_idx + 1,
+            )
 
-            b.rew.append(rews_f32[i])
-            b.done.append(done_b[i])
-            b.act_mask.append(masks_b[i])
+            if b.obs is None or b.act is None or b.logp is None or b.val is None or b.rew is None or b.done is None or b.act_mask is None:
+                raise RuntimeError(f"[ppo] buffer allocation failed for aid={aid}")
+
+            b.obs[write_idx].copy_(obs_d[i])
+            b.act[write_idx] = acts_d[i]
+            b.logp[write_idx] = logp_f32[i]
+            b.val[write_idx] = vals_f32[i]
+            b.rew[write_idx] = rews_f32[i]
+            b.done[write_idx] = done_b[i]
+            b.act_mask[write_idx].copy_(masks_b[i])
+            b.write_ptr = write_idx + 1
 
             # Store bootstrap V(s_{t+1}) if provided.
             if bs_f32 is not None:
@@ -618,7 +708,7 @@ class PerAgentPPORuntime:
             b = self._buf.get(aid, None)
 
             # Skip if empty buffer.
-            if b is None or not b.obs:
+            if b is None or int(getattr(b, "write_ptr", 0)) <= 0:
                 continue
 
             # Retrieve this slot's brain (policy/value network).
@@ -634,36 +724,27 @@ class PerAgentPPORuntime:
             opt = self._get_opt(aid, model)
             lr_before = float(opt.param_groups[0]["lr"]) if len(getattr(opt, "param_groups", [])) > 0 else float(self.lr)
 
-            # Stack rollout lists into tensors:
+            # Slice valid prefix from this slot's tensor-backed rollout storage.
             # T here is "buffer length" (could be < self.T for flush cases).
-            obs = torch.stack(b.obs)                         # (T, obs_dim)
-            act = torch.stack(b.act).long()                  # (T,)
-            logp_old = torch.stack(b.logp).to(torch.float32) # (T,)
-            val_old = torch.cat(b.val).to(torch.float32)     # (T,)
-            rew = torch.stack(b.rew).to(torch.float32)       # (T,)
-            done = torch.stack(b.done).bool()                # (T,)
+            T_buf = int(b.write_ptr)
+            if b.obs is None or b.act is None or b.logp is None or b.val is None or b.rew is None or b.done is None:
+                raise RuntimeError(f"[ppo] incomplete rollout storage for aid={aid}")
+
+            obs = b.obs.narrow(0, 0, T_buf)                     # (T, obs_dim)
+            act = b.act.narrow(0, 0, T_buf).long()              # (T,)
+            logp_old = b.logp.narrow(0, 0, T_buf).to(torch.float32)
+            val_old = b.val.narrow(0, 0, T_buf).to(torch.float32)
+            rew = b.rew.narrow(0, 0, T_buf).to(torch.float32)
+            done = b.done.narrow(0, 0, T_buf).bool()
 
             # Rollout action masks (new checkpoints). Older checkpoints may not have them.
-            if len(getattr(b, "act_mask", [])) == len(b.obs):
-                act_mask = torch.stack(b.act_mask).bool()    # (T, act_dim)
-            elif len(getattr(b, "act_mask", [])) == 0:
+            if b.act_mask is not None:
+                act_mask = b.act_mask.narrow(0, 0, T_buf).bool()    # (T, act_dim)
+            else:
                 # Cannot recover exact rollout masks from old checkpoints (pre-patch schema).
                 # Drop this buffered segment instead of training with mismatched PPO semantics.
-                b.obs.clear()
-                b.act.clear()
-                b.logp.clear()
-                b.val.clear()
-                b.rew.clear()
-                b.done.clear()
-                if hasattr(b, "act_mask"):
-                    b.act_mask.clear()
-                b.bootstrap = None
+                self._clear_buf(b)
                 continue
-            else:
-                raise RuntimeError(
-                    f"[ppo] act_mask buffer length mismatch for aid={aid}: "
-                    f"{len(getattr(b, 'act_mask', []))} vs {len(b.obs)}"
-                )
 
             # Compute advantages and returns using GAE.
             last_v = b.bootstrap
@@ -847,15 +928,8 @@ class PerAgentPPORuntime:
                     agg["lr_before_sum"] += float(lr_before)
                     agg["lr_after_sum"] += float(lr_after)
 
-            # Clear buffer after training
-            b.obs.clear()
-            b.act.clear()
-            b.logp.clear()
-            b.val.clear()
-            b.rew.clear()
-            b.done.clear()
-            b.act_mask.clear()
-            b.bootstrap = None
+            # Clear logical contents after training while retaining preallocated tensors.
+            self._clear_buf(b)
 
         def _mean_from_agg(prefix: str) -> float:
             c = int(agg.get(f"{prefix}_count", 0)) if agg is not None else 0
@@ -992,14 +1066,36 @@ class PerAgentPPORuntime:
 
         buf_out: Dict[int, Any] = {}
         for aid, b in self._buf.items():
+            n = int(getattr(b, "write_ptr", 0))
+            if n <= 0 or b.obs is None or b.act is None or b.logp is None or b.val is None or b.rew is None or b.done is None:
+                buf_out[int(aid)] = {
+                    "obs": [],
+                    "act": [],
+                    "logp": [],
+                    "val": [],
+                    "rew": [],
+                    "done": [],
+                    "act_mask": [],
+                    # bootstrap not saved (ephemeral / window-boundary specific)
+                }
+                continue
+
+            obs_used = b.obs.narrow(0, 0, n)
+            act_used = b.act.narrow(0, 0, n)
+            logp_used = b.logp.narrow(0, 0, n)
+            val_used = b.val.narrow(0, 0, n).unsqueeze(-1)
+            rew_used = b.rew.narrow(0, 0, n)
+            done_used = b.done.narrow(0, 0, n)
+            act_mask_used = b.act_mask.narrow(0, 0, n) if b.act_mask is not None else []
+
             buf_out[int(aid)] = {
-                "obs":  cpuize(list(b.obs)),
-                "act":  cpuize(list(b.act)),
-                "logp": cpuize(list(b.logp)),
-                "val":  cpuize(list(b.val)),
-                "rew":  cpuize(list(b.rew)),
-                "done": cpuize(list(b.done)),
-                "act_mask": cpuize(list(b.act_mask)),
+                "obs":  cpuize(list(obs_used)),
+                "act":  cpuize(list(act_used)),
+                "logp": cpuize(list(logp_used)),
+                "val":  cpuize(list(val_used)),
+                "rew":  cpuize(list(rew_used)),
+                "done": cpuize(list(done_used)),
+                "act_mask": cpuize(list(act_mask_used)) if b.act_mask is not None else [],
                 # bootstrap not saved (ephemeral / window-boundary specific)
             }
 
@@ -1057,15 +1153,68 @@ class PerAgentPPORuntime:
         buf_in: Dict[int, Any] = state.get("buf", {})
         for aid, payload in buf_in.items():
             aid_i = int(aid)
-            self._buf[aid_i] = _Buf(
-                obs=to_dev(payload.get("obs", [])),
-                act=to_dev(payload.get("act", [])),
-                logp=to_dev(payload.get("logp", [])),
-                val=to_dev(payload.get("val", [])),
-                rew=to_dev(payload.get("rew", [])),
-                done=to_dev(payload.get("done", [])),
-                act_mask=to_dev(payload.get("act_mask", [])),
+
+            def _payload_to_tensor(x: Any) -> Optional[torch.Tensor]:
+                if torch.is_tensor(x):
+                    return x.to(dev)
+                if isinstance(x, list):
+                    if len(x) == 0:
+                        return None
+                    rows = [to_dev(v) for v in x]
+                    return torch.stack(rows, dim=0)
+                return None
+
+            obs_t = _payload_to_tensor(payload.get("obs", []))
+            act_t = _payload_to_tensor(payload.get("act", []))
+            logp_t = _payload_to_tensor(payload.get("logp", []))
+            val_t = _payload_to_tensor(payload.get("val", []))
+            rew_t = _payload_to_tensor(payload.get("rew", []))
+            done_t = _payload_to_tensor(payload.get("done", []))
+            act_mask_t = _payload_to_tensor(payload.get("act_mask", []))
+
+            size = 0
+            for t in (obs_t, act_t, logp_t, val_t, rew_t, done_t, act_mask_t):
+                if t is not None:
+                    size = int(t.size(0))
+                    break
+
+            if size <= 0:
+                self._buf[aid_i] = _Buf()
+                continue
+
+            if obs_t is None or act_t is None or logp_t is None or val_t is None or rew_t is None or done_t is None:
+                raise RuntimeError(f"[ppo] checkpoint rollout payload incomplete for aid={aid_i}")
+
+            obs_t = obs_t.reshape(size, int(self.obs_dim))
+            act_t = act_t.reshape(size)
+            logp_t = logp_t.reshape(size).to(torch.float32)
+            val_t = val_t.reshape(size).to(torch.float32)
+            rew_t = rew_t.reshape(size).to(torch.float32)
+            done_t = done_t.reshape(size).to(torch.bool)
+            if act_mask_t is not None:
+                act_mask_t = act_mask_t.reshape(size, int(self.act_dim)).to(torch.bool)
+
+            cap = max(int(self.T), size)
+            buf = _Buf(
+                obs=torch.empty((cap, int(self.obs_dim)), device=dev, dtype=obs_t.dtype),
+                act=torch.empty((cap,), device=dev, dtype=act_t.dtype),
+                logp=torch.empty((cap,), device=dev, dtype=torch.float32),
+                val=torch.empty((cap,), device=dev, dtype=torch.float32),
+                rew=torch.empty((cap,), device=dev, dtype=torch.float32),
+                done=torch.empty((cap,), device=dev, dtype=torch.bool),
+                act_mask=(torch.empty((cap, int(self.act_dim)), device=dev, dtype=torch.bool) if act_mask_t is not None else None),
+                write_ptr=size,
             )
+            buf.obs[:size].copy_(obs_t)
+            buf.act[:size].copy_(act_t)
+            buf.logp[:size].copy_(logp_t)
+            buf.val[:size].copy_(val_t)
+            buf.rew[:size].copy_(rew_t)
+            buf.done[:size].copy_(done_t)
+            if act_mask_t is not None and buf.act_mask is not None:
+                buf.act_mask[:size].copy_(act_mask_t)
+
+            self._buf[aid_i] = buf
 
         # Restore optimizers and schedulers
         opt_in: Dict[int, Any] = state.get("opt", {})
