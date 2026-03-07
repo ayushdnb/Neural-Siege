@@ -259,16 +259,55 @@ class TickEngine:
         self._g_wall = torch.tensor(1.0, device=self.device, dtype=self._grid_dt)
 
         # ================================================================
-        # Instinct cache (computed under no_grad)
+        # Preallocated per-tick reward / observation scratch
+        # ================================================================
+        #
+        # These tensors are capacity-bounded and reused in-place every tick.
+        # This removes several hot torch.zeros/torch.empty allocations from run_tick()
+        # and _build_transformer_obs() without changing what the simulation computes.
+        #
+        self._capacity = int(self.registry.capacity)
+        self._reward_individual_total = torch.zeros(self._capacity, device=self.device, dtype=self._data_dt)
+        self._reward_kill_individual = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
+        self._reward_damage_dealt_individual = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
+        self._reward_damage_taken_penalty = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
+        self._reward_contested_cp_individual = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
+        self._reward_healing_recovered = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
+
+        self._obs_on_heal = torch.zeros(self._capacity, device=self.device, dtype=torch.bool)
+        self._obs_on_cp = torch.zeros(self._capacity, device=self.device, dtype=torch.bool)
+        self._obs_rich_base = torch.empty((self._capacity, 23), device=self.device, dtype=self._data_dt)
+        self._obs_rich = torch.empty(
+            (self._capacity, int(self._OBS_DIM) - (32 * 8)),
+            device=self.device,
+            dtype=self._data_dt,
+        )
+
+        # ================================================================
+        # Instinct cache / scratch (computed under no_grad)
         # ================================================================
         #
         # "Instinct" here is a computed feature: local density of allies/enemies
         # around each agent within a radius R. Computing offsets for a discrete
         # circle can be expensive, so we cache offsets by radius.
         #
+        # The (N,M) scratch tensors are allocated lazily because M depends on the
+        # configured instinct radius. They are sliced to the live alive-count each call.
+        #
         self._instinct_cached_r: int = -999999
         self._instinct_offsets: Optional[torch.Tensor] = None
         self._instinct_area: float = 1.0
+        self._instinct_scratch_m: int = 0
+        self._instinct_xx: Optional[torch.Tensor] = None
+        self._instinct_yy: Optional[torch.Tensor] = None
+        self._instinct_ally_mask: Optional[torch.Tensor] = None
+        self._instinct_enemy_mask: Optional[torch.Tensor] = None
+        self._instinct_ally_arch_mask: Optional[torch.Tensor] = None
+        self._instinct_ally_sold_mask: Optional[torch.Tensor] = None
+        self._instinct_ally_occ: Optional[torch.Tensor] = None
+        self._instinct_enemy_occ: Optional[torch.Tensor] = None
+        self._instinct_noise = torch.empty((self._capacity,), device=self.device, dtype=torch.float32)
+        self._instinct_out = torch.empty((self._capacity, 4), device=self.device, dtype=self._data_dt)
 
         # ================================================================
         # THEORY: Constants on GPU
@@ -298,6 +337,34 @@ class TickEngine:
                 obs_dim=self._OBS_DIM,
                 act_dim=self._ACTIONS,
             )
+
+    # -------------------------------------------------------------------------
+    # Per-tick scratch reset helpers
+    # -------------------------------------------------------------------------
+    def _reset_tick_reward_buffers(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reset and return the capacity-sized reward buffers reused by run_tick().
+
+        Safety rule:
+        - Every buffer is zeroed at tick start before any reward accumulation.
+        - The returned tensors are the canonical per-tick reward stores for this engine.
+        """
+        self._reward_individual_total.zero_()
+        self._reward_kill_individual.zero_()
+        self._reward_damage_dealt_individual.zero_()
+        self._reward_damage_taken_penalty.zero_()
+        self._reward_contested_cp_individual.zero_()
+        self._reward_healing_recovered.zero_()
+        return (
+            self._reward_individual_total,
+            self._reward_kill_individual,
+            self._reward_damage_dealt_individual,
+            self._reward_damage_taken_penalty,
+            self._reward_contested_cp_individual,
+            self._reward_healing_recovered,
+        )
 
     # -------------------------------------------------------------------------
     # PPO: reset state for agents that just respawned
@@ -462,6 +529,36 @@ class TickEngine:
         return (self.registry.agent_data[:, COL_ALIVE] > 0.5).nonzero(as_tuple=False).squeeze(1)
 
     # -------------------------------------------------------------------------
+    # Instinct scratch: lazily sized (capacity, M) reusable buffers
+    # -------------------------------------------------------------------------
+    def _ensure_instinct_scratch(self, min_offsets: int) -> None:
+        """
+        Ensure the reusable instinct scratch tensors can hold (capacity, min_offsets).
+
+        Why lazy sizing?
+        - The instinct offset count M depends on the configured radius.
+        - Capacity is fixed, but M can change if config changes between runs/resumes.
+
+        Safety rule:
+        - We allocate once per new required width and then always slice [:N, :M].
+        - Callers must still fully overwrite or zero the used slices before reading them.
+        """
+        need_m = max(1, int(min_offsets))
+        if self._instinct_xx is not None and self._instinct_scratch_m >= need_m:
+            return
+
+        shape_nm = (self._capacity, need_m)
+        self._instinct_xx = torch.empty(shape_nm, device=self.device, dtype=torch.long)
+        self._instinct_yy = torch.empty(shape_nm, device=self.device, dtype=torch.long)
+        self._instinct_ally_mask = torch.empty(shape_nm, device=self.device, dtype=torch.bool)
+        self._instinct_enemy_mask = torch.empty(shape_nm, device=self.device, dtype=torch.bool)
+        self._instinct_ally_arch_mask = torch.empty(shape_nm, device=self.device, dtype=torch.bool)
+        self._instinct_ally_sold_mask = torch.empty(shape_nm, device=self.device, dtype=torch.bool)
+        self._instinct_ally_occ = torch.empty((self._capacity,), device=self.device, dtype=self._grid_dt)
+        self._instinct_enemy_occ = torch.empty((self._capacity,), device=self.device, dtype=self._grid_dt)
+        self._instinct_scratch_m = need_m
+
+    # -------------------------------------------------------------------------
     # Instinct offsets: cached discrete circle offsets
     # -------------------------------------------------------------------------
     @torch.no_grad()
@@ -544,8 +641,18 @@ class TickEngine:
         data = self.registry.agent_data
         offsets, area = self._get_instinct_offsets()
         M = int(offsets.size(0))
+        out = self._instinct_out[:N]
         if M <= 0 or area <= 0.0:
-            return torch.zeros((N, 4), device=self.device, dtype=self._data_dt)
+            out.zero_()
+            return out
+
+        self._ensure_instinct_scratch(M)
+        xx = self._instinct_xx[:N, :M]
+        yy = self._instinct_yy[:N, :M]
+        ally_mask = self._instinct_ally_mask[:N, :M]
+        enemy_mask = self._instinct_enemy_mask[:N, :M]
+        ally_arch = self._instinct_ally_arch_mask[:N, :M]
+        ally_sold = self._instinct_ally_sold_mask[:N, :M]
 
         # ---------------------------------------------------------------------
         # Broadcasting (important tensor technique)
@@ -562,8 +669,10 @@ class TickEngine:
         oy = offsets[:, 1].view(1, M)
 
         # Clamp to map bounds to avoid indexing outside the grid.
-        xx = (x0 + ox).clamp(0, self.W - 1)
-        yy = (y0 + oy).clamp(0, self.H - 1)
+        torch.add(x0, ox, out=xx)
+        xx.clamp_(0, self.W - 1)
+        torch.add(y0, oy, out=yy)
+        yy.clamp_(0, self.H - 1)
 
         # occ: occupancy/team at each sampled cell
         # uid: unit id at each sampled cell
@@ -576,16 +685,22 @@ class TickEngine:
 
         # Determine ally and enemy occupancy codes for each agent.
         # These values (2.0 and 3.0) are project conventions for team encoding.
-        ally_occ = torch.where(team_is_red, occ.new_full((N,), 2.0), occ.new_full((N,), 3.0)).view(N, 1)
-        enemy_occ = torch.where(team_is_red, occ.new_full((N,), 3.0), occ.new_full((N,), 2.0)).view(N, 1)
+        ally_occ = self._instinct_ally_occ[:N]
+        enemy_occ = self._instinct_enemy_occ[:N]
+        ally_occ.fill_(3.0)
+        ally_occ[team_is_red] = 2.0
+        enemy_occ.fill_(2.0)
+        enemy_occ[team_is_red] = 3.0
 
-        ally_mask = (occ == ally_occ)
-        enemy_mask = (occ == enemy_occ)
+        torch.eq(occ, ally_occ.view(N, 1), out=ally_mask)
+        torch.eq(occ, enemy_occ.view(N, 1), out=enemy_mask)
 
         # Unit types:
         # 1 = soldier, 2 = archer (as implied by later checks)
-        ally_arch = ally_mask & (uid == 2)
-        ally_sold = ally_mask & (uid == 1)
+        torch.eq(uid, 2, out=ally_arch)
+        torch.logical_and(ally_mask, ally_arch, out=ally_arch)
+        torch.eq(uid, 1, out=ally_sold)
+        torch.logical_and(ally_mask, ally_sold, out=ally_sold)
 
         # Count nearby allies/enemies per agent by summing along offset dimension.
         ally_arch_c = ally_arch.sum(dim=1).to(torch.float32)
@@ -598,7 +713,9 @@ class TickEngine:
         ally_sold_c = (ally_sold_c - (self_unit == 1.0).to(torch.float32)).clamp_min(0.0)
 
         # Add noise to enemy count (fog-of-war style uncertainty).
-        noise = torch.randn((N,), device=self.device, dtype=torch.float32) * 0.25
+        noise = self._instinct_noise[:N]
+        torch.randn((N,), out=noise)
+        noise.mul_(0.25)
         enemy_c_noisy = (enemy_c + noise).clamp_min(0.0)
 
         # Normalize by area to convert counts -> densities.
@@ -612,8 +729,11 @@ class TickEngine:
         ally_total_d = ally_arch_d + ally_sold_d
         threat = enemy_d / (ally_total_d + eps)
 
-        out = torch.stack([ally_arch_d, ally_sold_d, enemy_d, threat], dim=1)
-        return out.to(dtype=self._data_dt)
+        out[:, 0].copy_(ally_arch_d.to(self._data_dt))
+        out[:, 1].copy_(ally_sold_d.to(self._data_dt))
+        out[:, 2].copy_(enemy_d.to(self._data_dt))
+        out[:, 3].copy_(threat.to(self._data_dt))
+        return out
 
     # -------------------------------------------------------------------------
     # Death application: remove dead agents from grid and update stats/metrics
@@ -857,9 +977,11 @@ class TickEngine:
         if self._z_heal is not None:
             on_heal = self._z_heal[pos_xy[:, 1], pos_xy[:, 0]]
         else:
-            on_heal = torch.zeros(N, device=self.device, dtype=torch.bool)
+            on_heal = self._obs_on_heal[:N]
+            on_heal.zero_()
 
-        on_cp = torch.zeros(N, device=self.device, dtype=torch.bool)
+        on_cp = self._obs_on_cp[:N]
+        on_cp.zero_()
         if self._z_cp_masks:
             for cp_mask in self._z_cp_masks:
                 # |= accumulates: if any CP mask is True at that cell, on_cp becomes True.
@@ -895,7 +1017,7 @@ class TickEngine:
         #
         # Build the exact same 23-column layout, but write directly into a single
         # preallocated tensor to avoid many temporary (N,) vectors each tick.
-        rich_base = torch.empty((N, 23), device=self.device, dtype=self._data_dt)
+        rich_base = self._obs_rich_base[:N]
         rich_base[:, 0] = alive_data[:, COL_HP] / hp_max
         rich_base[:, 1] = alive_data[:, COL_X] / (self.W - 1)
         rich_base[:, 2] = alive_data[:, COL_Y] / (self.H - 1)
@@ -924,7 +1046,9 @@ class TickEngine:
             raise RuntimeError(f"instinct shape {tuple(instinct.shape)} != (N,4)")
 
         # Concatenate base rich features and instinct features.
-        rich = torch.cat([rich_base, instinct], dim=1)
+        rich = self._obs_rich[:N]
+        rich[:, :23].copy_(rich_base)
+        rich[:, 23:].copy_(instinct)
 
         expected_rich_dim = int(self._OBS_DIM) - expected_ray_dim
         if rich.shape != (N, expected_rich_dim):
@@ -1169,15 +1293,14 @@ class TickEngine:
 
         # Individual rewards tensor over ALL slots (capacity-sized).
         # This is later indexed for just the participating agents in PPO logging.
-        individual_rewards = torch.zeros(self.registry.capacity, device=self.device, dtype=self._data_dt)
-
-        # Reward-category buffers kept separate so telemetry can answer:
-        # "Are agents improving damage dealt / kill reward / CP reward / HP reward over generations?"
-        reward_kill_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
-        reward_damage_dealt_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
-        reward_damage_taken_penalty = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
-        reward_contested_cp_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
-        reward_healing_recovered = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+        (
+            individual_rewards,
+            reward_kill_individual,
+            reward_damage_dealt_individual,
+            reward_damage_taken_penalty,
+            reward_contested_cp_individual,
+            reward_healing_recovered,
+        ) = self._reset_tick_reward_buffers()
 
         # Victim slot -> credited killer slot for combat deaths in this tick.
         combat_killer_slot_by_victim: Dict[int, int] = {}
