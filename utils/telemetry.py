@@ -367,6 +367,7 @@ class TelemetrySession:
         self.events_dir = self.telemetry_dir / "events"
         self.agent_life_path = self.telemetry_dir / "agent_life.csv"
         self.lineage_edges_path = self.telemetry_dir / "lineage_edges.csv"
+        self.schema_manifest_path = self.telemetry_dir / "schema_manifest.json"
 
         # Sidecar files added by patch (config gated)
         self.run_meta_path = self.telemetry_dir / "run_meta.json"
@@ -379,6 +380,28 @@ class TelemetrySession:
         self.headless_summary_path = self.telemetry_dir / "telemetry_summary.csv"
         self.ppo_training_telemetry_path = self.telemetry_dir / "ppo_training_telemetry.csv"
         self.mutation_events_path = self.telemetry_dir / "mutation_events.csv"
+        self.dead_agents_detailed_path = self.telemetry_dir / "dead_agents_log_detailed.csv"
+
+        # ---------------------------------------------------------------------
+        # Per-slot PPO reward accumulators
+        # ---------------------------------------------------------------------
+        # Why per-slot?
+        # - The engine computes rewards on live registry slots.
+        # - We want zero per-tick CPU sync overhead.
+        # - On death, we freeze slot totals into the persistent AgentLife record.
+        # - On birth, the slot is reset/seeded.
+        self._reward_slot_total = None
+        self._reward_slot_individual_total = None
+        self._reward_slot_team_total = None
+        self._reward_slot_hp = None
+        self._reward_slot_kill_individual = None
+        self._reward_slot_damage_dealt_individual = None
+        self._reward_slot_damage_taken_penalty = None
+        self._reward_slot_contested_cp_individual = None
+        self._reward_slot_team_kill = None
+        self._reward_slot_team_death = None
+        self._reward_slot_team_cp = None
+        self._reward_slot_healing_recovered = None
 
         # Create directories (safe even if they already exist).
         self.telemetry_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +531,7 @@ class TelemetrySession:
 
         # Offspring count stored separately to keep `_life` simpler.
         self._offspring_count: Dict[int, int] = {}
+        self._lineage_edge_count: Dict[int, int] = {}
 
         # ---------------------------------------------------------------------
         # Event buffering and chunking
@@ -528,8 +552,24 @@ class TelemetrySession:
         if not self.lineage_edges_path.exists():
             self._append_csv_rows(
                 self.lineage_edges_path,
-                fieldnames=["tick", "parent_id", "child_id"],
+                fieldnames=[
+                    "tick",
+                    "parent_id",
+                    "child_id",
+                    "parent_unit_type",
+                    "child_unit_type",
+                    "parent_team",
+                    "spawn_reason",
+                    "parent_generation",
+                    "child_generation",
+                    "mutation_flag",
+                    "rare_mutation",
+                    "mutation_delta_hp",
+                    "mutation_delta_atk",
+                    "mutation_delta_vis",
+                ],
                 rows=[],
+                strict_schema=True,
             )
 
         # Create headers for agent_static and tick_summary if enabled and new.
@@ -589,12 +629,20 @@ class TelemetrySession:
                     "team_id",
                     "team_name",
                     "unit_id",
+                    "parent_unit_id",
+                    "child_generation",
+                    "spawn_reason",
                     "spawn_hp",
                     "spawn_atk",
                     "spawn_vis",
                     "parent_agent_id",
                     "cloned",
                     "mutation_std",
+                    "mutation_flag",
+                    "rare_mutation",
+                    "mutation_delta_hp",
+                    "mutation_delta_atk",
+                    "mutation_delta_vis",
                 ],
                 rows=[],
             )
@@ -665,11 +713,24 @@ class TelemetrySession:
                     # Basic integer/string fields.
                     # - slot_id/team/unit_type are numeric but might appear as "12.0"
                     # - notes is free-form text
-                    for k in ("slot_id", "team", "unit_type", "notes"):
+                    for k in (
+                        "slot_id",
+                        "team",
+                        "unit_type",
+                        "notes",
+                        "spawn_reason",
+                        "parent_unit_type",
+                        "parent_team",
+                        "parent_generation",
+                        "generation",
+                    ):
                         v = row.get(k, "")
                         if v != "":
                             try:
-                                rec[k] = int(float(v)) if k != "notes" else str(v)
+                                if k in ("notes", "spawn_reason"):
+                                    rec[k] = str(v)
+                                else:
+                                    rec[k] = int(float(v))
                             except Exception:
                                 rec[k] = str(v)
 
@@ -692,6 +753,29 @@ class TelemetrySession:
                             except Exception:
                                 pass
 
+                    for k in ("mutation_flag", "rare_mutation"):
+                        v = (row.get(k) or "").strip()
+                        if v != "":
+                            try:
+                                rec[k] = bool(int(float(v)))
+                            except Exception:
+                                rec[k] = str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+                    for k in ("mutation_delta_hp", "mutation_delta_atk"):
+                        v = (row.get(k) or "").strip()
+                        if v != "":
+                            try:
+                                rec[k] = float(v)
+                            except Exception:
+                                pass
+
+                    v = (row.get("mutation_delta_vis") or "").strip()
+                    if v != "":
+                        try:
+                            rec["mutation_delta_vis"] = int(float(v))
+                        except Exception:
+                            pass
+
                     # Movement totals (optional columns; may not exist in older runs).
                     for k in (
                         "moves_attempted",
@@ -710,18 +794,40 @@ class TelemetrySession:
                             except Exception:
                                 pass
 
-                    # reward_total is numeric but may be blank.
-                    v = (row.get("reward_total") or "").strip()
-                    if v != "":
-                        try:
-                            rec["reward_total"] = float(v)
-                        except Exception:
-                            pass
+                    # Reward totals / PPO category columns (optional in older runs).
+                    for k in (
+                        "reward_total",
+                        "reward_individual_total",
+                        "reward_team_total",
+                        "reward_hp",
+                        "reward_kill_individual",
+                        "reward_damage_dealt_individual",
+                        "reward_damage_taken_penalty",
+                        "reward_contested_cp_individual",
+                        "reward_team_kill",
+                        "reward_team_death",
+                        "reward_team_cp",
+                        "reward_healing_recovered",
+                    ):
+                        v = (row.get(k) or "").strip()
+                        if v != "":
+                            try:
+                                rec[k] = float(v)
+                            except Exception:
+                                pass
 
-                    # death_cause is free-form.
+                    # Structured death metadata.
                     v = (row.get("death_cause") or "").strip()
                     if v != "":
                         rec["death_cause"] = str(v)
+
+                    for k in ("killer_id", "killer_slot", "killer_team"):
+                        v = (row.get(k) or "").strip()
+                        if v != "":
+                            try:
+                                rec[k] = int(float(v))
+                            except Exception:
+                                pass
 
                     self._life[aid] = rec
 
@@ -820,6 +926,68 @@ class TelemetrySession:
                 if set(r.keys()) != set(fieldnames):
                     r = {k: r.get(k, "") for k in fieldnames}
                 w.writerow(r)
+
+    def write_schema_manifest(self, manifest: Dict[str, Any]) -> None:
+        """
+        Persist a small telemetry schema/mechanics manifest.
+        This is the append-in-place compatibility contract.
+        """
+        if not self.enabled:
+            return
+
+        out = dict(manifest or {})
+        out.setdefault("schema_version", self.schema_version_str)
+        _atomic_write_text(self.schema_manifest_path, json.dumps(out, indent=2, sort_keys=True))
+
+    def validate_schema_manifest_compat(self, manifest: Dict[str, Any]) -> None:
+        """
+        Refuse append-in-place when the existing run uses a different telemetry contract.
+        """
+        if not self.enabled:
+            return
+        if not self.schema_manifest_path.exists():
+            raise RuntimeError(
+                f"[telemetry] missing schema manifest for append-in-place resume: {self.schema_manifest_path}"
+            )
+
+        existing = json.loads(self.schema_manifest_path.read_text(encoding="utf-8"))
+        incoming = dict(manifest or {})
+
+        keys = (
+            "schema_version",
+            "lineage_fields",
+            "reward_fields",
+            "death_causes",
+            "mechanics",
+        )
+        mismatches = []
+        for k in keys:
+            if existing.get(k) != incoming.get(k):
+                mismatches.append(k)
+        if mismatches:
+            raise RuntimeError(
+                f"[telemetry] append-in-place manifest mismatch: keys={mismatches} "
+                f"existing={{{k: existing.get(k) for k in mismatches}}} "
+                f"incoming={{{k: incoming.get(k) for k in mismatches}}}"
+            )
+
+    def flush(self, reason: str = "manual") -> None:
+        """
+        Best-effort mid-run flush used by checkpointing and shutdown paths.
+        """
+        if not self.enabled:
+            return
+
+        self._flush_event_chunk()
+        self._flush_agent_life_snapshot()
+        self._flush_move_summary()
+        self._flush_counters()
+        self._drain_and_flush_ppo_rich_telemetry(
+            observed_tick=self._last_tick_seen,
+            force=True,
+        )
+        if self._last_tick_seen is not None and self.tick_summary_every > 0:
+            self._write_tick_summary(tick=int(self._last_tick_seen))
 
     def _event_schema_version_int(self) -> int:
         """Return schema version as int for event payloads (robust to \"v2\" strings)."""
@@ -966,11 +1134,31 @@ class TelemetrySession:
         fieldnames = [
             "agent_id", "slot_id", "team", "unit_type",
             "born_tick", "death_tick", "lifespan_ticks", "parent_id", "offspring_count",
+            "spawn_reason", "parent_unit_type", "parent_team", "parent_generation", "generation",
+            "mutation_flag", "rare_mutation", "mutation_delta_hp", "mutation_delta_atk", "mutation_delta_vis",
             "kills_total", "damage_dealt_total", "damage_taken_total", "notes",
-            # Additional fields reserved for future extensions
+
             "moves_attempted", "moves_success", "moves_blocked_wall", "moves_blocked_occupied",
             "moves_conflict_lost", "moves_conflict_tie",
-            "cells_walked_total_l1", "reward_total", "death_cause", "last_seen_tick",
+            "cells_walked_total_l1", "last_seen_tick",
+
+            "reward_total",
+            "reward_individual_total",
+            "reward_team_total",
+            "reward_hp",
+            "reward_kill_individual",
+            "reward_damage_dealt_individual",
+            "reward_damage_taken_penalty",
+            "reward_contested_cp_individual",
+            "reward_team_kill",
+            "reward_team_death",
+            "reward_team_cp",
+            "reward_healing_recovered",
+
+            "death_cause",
+            "killer_id",
+            "killer_slot",
+            "killer_team",
         ]
 
         rows: List[Dict[str, Any]] = []
@@ -1000,6 +1188,25 @@ class TelemetrySession:
                 move_lists = (a0, a1, a2, a3, a4, a5, a6, a7)
             except Exception:
                 move_lists = None
+
+        reward_lists = None
+        if self.enabled and getattr(self, "_reward_slot_total", None) is not None:
+            try:
+                r0 = self._reward_slot_total.detach().cpu().tolist()
+                r1 = self._reward_slot_individual_total.detach().cpu().tolist()
+                r2 = self._reward_slot_team_total.detach().cpu().tolist()
+                r3 = self._reward_slot_hp.detach().cpu().tolist()
+                r4 = self._reward_slot_kill_individual.detach().cpu().tolist()
+                r5 = self._reward_slot_damage_dealt_individual.detach().cpu().tolist()
+                r6 = self._reward_slot_damage_taken_penalty.detach().cpu().tolist()
+                r7 = self._reward_slot_contested_cp_individual.detach().cpu().tolist()
+                r8 = self._reward_slot_team_kill.detach().cpu().tolist()
+                r9 = self._reward_slot_team_death.detach().cpu().tolist()
+                r10 = self._reward_slot_team_cp.detach().cpu().tolist()
+                r11 = self._reward_slot_healing_recovered.detach().cpu().tolist()
+                reward_lists = (r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11)
+            except Exception:
+                reward_lists = None
 
         for aid, rec in sorted(self._life.items(), key=lambda kv: kv[0]):
             r = dict(rec)
@@ -1033,6 +1240,30 @@ class TelemetrySession:
                             lst = int(a7[s])
                             if lst >= 0:
                                 r["last_seen_tick"] = lst
+                except Exception:
+                    pass
+
+            # Fill reward columns for currently-alive agents from per-slot accumulators.
+            # For dead agents, values are frozen into the life record at record_deaths().
+            if reward_lists is not None and r.get("death_tick", None) is None:
+                try:
+                    sid = r.get("slot_id", None)
+                    if sid is not None and sid != "":
+                        s = int(sid)
+                        (r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) = reward_lists
+                        if 0 <= s < len(r0):
+                            r["reward_total"] = float(r0[s])
+                            r["reward_individual_total"] = float(r1[s])
+                            r["reward_team_total"] = float(r2[s])
+                            r["reward_hp"] = float(r3[s])
+                            r["reward_kill_individual"] = float(r4[s])
+                            r["reward_damage_dealt_individual"] = float(r5[s])
+                            r["reward_damage_taken_penalty"] = float(r6[s])
+                            r["reward_contested_cp_individual"] = float(r7[s])
+                            r["reward_team_kill"] = float(r8[s])
+                            r["reward_team_death"] = float(r9[s])
+                            r["reward_team_cp"] = float(r10[s])
+                            r["reward_healing_recovered"] = float(r11[s])
                 except Exception:
                     pass
 
@@ -1165,6 +1396,66 @@ class TelemetrySession:
                 m = min(int(old_attempted.numel()), n)
                 if m > 0:
                     self._move_slot_attempted[:m] = old_attempted[:m].to(device=device)
+            except Exception:
+                pass
+
+    def _ensure_reward_slot_tensors(self, n_slots: int, device) -> None:
+        """
+        Lazily allocate per-slot PPO reward accumulator tensors.
+
+        Design goal:
+        - Keep reward-category accumulation on the simulation device (CPU/CUDA).
+        - Avoid per-tick GPU->CPU sync for all agents.
+        - Freeze totals into AgentLife on death; bulk-copy only during snapshots.
+        """
+        if not self.enabled:
+            return
+
+        try:
+            import torch
+        except Exception:
+            return
+
+        n = int(n_slots)
+        if n <= 0:
+            return
+
+        cur = getattr(self, "_reward_slot_total", None)
+        if cur is not None and int(cur.numel()) == n and str(cur.device) == str(device):
+            return
+
+        names = (
+            "_reward_slot_total",
+            "_reward_slot_individual_total",
+            "_reward_slot_team_total",
+            "_reward_slot_hp",
+            "_reward_slot_kill_individual",
+            "_reward_slot_damage_dealt_individual",
+            "_reward_slot_damage_taken_penalty",
+            "_reward_slot_contested_cp_individual",
+            "_reward_slot_team_kill",
+            "_reward_slot_team_death",
+            "_reward_slot_team_cp",
+            "_reward_slot_healing_recovered",
+        )
+
+        old = {name: getattr(self, name, None) for name in names}
+
+        def _new_zeros():
+            return torch.zeros((n,), device=device, dtype=torch.float32)
+
+        for name in names:
+            setattr(self, name, _new_zeros())
+
+        old_total = old.get("_reward_slot_total", None)
+        if old_total is not None:
+            try:
+                m = min(int(old_total.numel()), n)
+                if m > 0:
+                    for name in names:
+                        prev = old.get(name, None)
+                        if prev is not None:
+                            getattr(self, name)[:m] = prev[:m].to(device=device, dtype=torch.float32)
             except Exception:
                 pass
 
@@ -1397,6 +1688,12 @@ class TelemetrySession:
 
             if r.get("damage_taken_total", 0.0) < 0:
                 self._anomaly(f"agent_id={aid}: negative damage_taken_total")
+
+        for parent_id, cnt in self._lineage_edge_count.items():
+            if int(self._offspring_count.get(int(parent_id), 0)) != int(cnt):
+                self._anomaly(
+                    f"parent_id={parent_id}: offspring_count mismatch life={self._offspring_count.get(int(parent_id), 0)} edges={cnt}"
+                )
 
     # =============================================================================
     # Public API called from main/tick
@@ -1642,11 +1939,7 @@ class TelemetrySession:
                         pass
 
                 if not recovered:
-                    # Surface once (still keep _anomaly behavior)
-                    #try:
-                    #    print(f"[telemetry] ppo rich telemetry flush failed: {type(e).__name__}: {e}")
-                    #except Exception:
-                    #    pass
+                    # Minimal surfacing while preserving existing anomaly policy.
                     self._anomaly(f"ppo rich telemetry flush failed: {e}")
 
     def _headless_summary_fieldnames(self) -> List[str]:
@@ -1934,12 +2227,20 @@ class TelemetrySession:
                     "team_id",
                     "team_name",
                     "unit_id",
+                    "parent_unit_id",
+                    "child_generation",
+                    "spawn_reason",
                     "spawn_hp",
                     "spawn_atk",
                     "spawn_vis",
                     "parent_agent_id",
                     "cloned",
                     "mutation_std",
+                    "mutation_flag",
+                    "rare_mutation",
+                    "mutation_delta_hp",
+                    "mutation_delta_atk",
+                    "mutation_delta_vis",
                 ],
                 rows=[row],
             )
@@ -2032,8 +2333,18 @@ class TelemetrySession:
             else:
                 aid = _to_int(data[slot, COL_AGENT_ID].item())
 
+            if int(aid) < 0:
+                self._anomaly(f"bootstrap: alive slot has invalid agent id slot={slot} aid={aid}")
+                continue
+
             team = _to_int(data[slot, COL_TEAM].item())
             unit = _to_int(data[slot, COL_UNIT].item())
+            generation = 0
+            if hasattr(registry, "generations") and 0 <= int(slot) < len(registry.generations):
+                generation = int(registry.generations[slot])
+                if generation < 0:
+                    self._anomaly(f"bootstrap: negative generation slot={slot} generation={generation}")
+                    generation = 0
 
             self.record_birth(
                 tick=tick,
@@ -2044,6 +2355,13 @@ class TelemetrySession:
                 parent_id=None,
                 notes=note,
                 allow_existing=True,
+                spawn_reason=str(note),
+                generation=int(generation),
+                mutation_flag=False,
+                rare_mutation=False,
+                mutation_delta_hp=0.0,
+                mutation_delta_atk=0.0,
+                mutation_delta_vis=0,
             )
 
             # Also write static attributes if enabled.
@@ -2067,6 +2385,16 @@ class TelemetrySession:
         parent_id: Optional[int],
         notes: str = "",
         allow_existing: bool = False,
+        spawn_reason: str = "",
+        parent_unit_type: Optional[int] = None,
+        parent_team: Optional[int] = None,
+        parent_generation: Optional[int] = None,
+        generation: Optional[int] = None,
+        mutation_flag: bool = False,
+        rare_mutation: bool = False,
+        mutation_delta_hp: Optional[float] = None,
+        mutation_delta_atk: Optional[float] = None,
+        mutation_delta_vis: Optional[int] = None,
     ) -> None:
         """
         Record an agent birth (creation).
@@ -2119,11 +2447,55 @@ class TelemetrySession:
             "death_tick": rec.get("death_tick", None),
 
             "parent_id": (int(parent_id) if parent_id is not None else None),
+            "spawn_reason": str(spawn_reason or rec.get("spawn_reason", notes or "")),
+            "parent_unit_type": (
+                int(parent_unit_type) if parent_unit_type is not None else rec.get("parent_unit_type", None)
+            ),
+            "parent_team": (
+                int(parent_team) if parent_team is not None else rec.get("parent_team", None)
+            ),
+            "parent_generation": (
+                int(parent_generation) if parent_generation is not None else rec.get("parent_generation", None)
+            ),
+            "generation": (
+                int(generation) if generation is not None else int(rec.get("generation", 0) or 0)
+            ),
+            "mutation_flag": bool(mutation_flag or rec.get("mutation_flag", False)),
+            "rare_mutation": bool(rare_mutation or rec.get("rare_mutation", False)),
+            "mutation_delta_hp": (
+                float(mutation_delta_hp) if mutation_delta_hp is not None else float(rec.get("mutation_delta_hp", 0.0) or 0.0)
+            ),
+            "mutation_delta_atk": (
+                float(mutation_delta_atk) if mutation_delta_atk is not None else float(rec.get("mutation_delta_atk", 0.0) or 0.0)
+            ),
+            "mutation_delta_vis": (
+                int(mutation_delta_vis) if mutation_delta_vis is not None else int(rec.get("mutation_delta_vis", 0) or 0)
+            ),
 
             # totals should persist if record exists
             "kills_total": int(rec.get("kills_total", 0)),
             "damage_dealt_total": float(rec.get("damage_dealt_total", 0.0)),
             "damage_taken_total": float(rec.get("damage_taken_total", 0.0)),
+
+            # PPO reward-category totals
+            "reward_total": float(rec.get("reward_total", 0.0)),
+            "reward_individual_total": float(rec.get("reward_individual_total", 0.0)),
+            "reward_team_total": float(rec.get("reward_team_total", 0.0)),
+            "reward_hp": float(rec.get("reward_hp", 0.0)),
+            "reward_kill_individual": float(rec.get("reward_kill_individual", 0.0)),
+            "reward_damage_dealt_individual": float(rec.get("reward_damage_dealt_individual", 0.0)),
+            "reward_damage_taken_penalty": float(rec.get("reward_damage_taken_penalty", 0.0)),
+            "reward_contested_cp_individual": float(rec.get("reward_contested_cp_individual", 0.0)),
+            "reward_team_kill": float(rec.get("reward_team_kill", 0.0)),
+            "reward_team_death": float(rec.get("reward_team_death", 0.0)),
+            "reward_team_cp": float(rec.get("reward_team_cp", 0.0)),
+            "reward_healing_recovered": float(rec.get("reward_healing_recovered", 0.0)),
+
+            # structured death forensics
+            "death_cause": rec.get("death_cause", None),
+            "killer_id": rec.get("killer_id", None),
+            "killer_slot": rec.get("killer_slot", None),
+            "killer_team": rec.get("killer_team", None),
 
             # notes: if notes provided, store it; else keep old
             "notes": str(notes or rec.get("notes", "")),
@@ -2164,13 +2536,91 @@ class TelemetrySession:
             except Exception:
                 pass
 
+        # Reset/seed per-slot reward counters for this slot.
+        try:
+            reg = getattr(self, "_registry", None)
+            if reg is not None and hasattr(reg, "agent_data"):
+                device = getattr(reg.agent_data, "device", "cpu")
+                n_slots = int(reg.agent_data.shape[0])
+                self._ensure_reward_slot_tensors(n_slots=n_slots, device=device)
+                sid = int(slot_id)
+
+                cur = getattr(self, "_reward_slot_total", None)
+                if cur is not None and 0 <= sid < int(cur.numel()):
+                    if allow_existing:
+                        self._reward_slot_total[sid] = float(rec.get("reward_total", 0.0) or 0.0)
+                        self._reward_slot_individual_total[sid] = float(rec.get("reward_individual_total", 0.0) or 0.0)
+                        self._reward_slot_team_total[sid] = float(rec.get("reward_team_total", 0.0) or 0.0)
+                        self._reward_slot_hp[sid] = float(rec.get("reward_hp", 0.0) or 0.0)
+                        self._reward_slot_kill_individual[sid] = float(rec.get("reward_kill_individual", 0.0) or 0.0)
+                        self._reward_slot_damage_dealt_individual[sid] = float(rec.get("reward_damage_dealt_individual", 0.0) or 0.0)
+                        self._reward_slot_damage_taken_penalty[sid] = float(rec.get("reward_damage_taken_penalty", 0.0) or 0.0)
+                        self._reward_slot_contested_cp_individual[sid] = float(rec.get("reward_contested_cp_individual", 0.0) or 0.0)
+                        self._reward_slot_team_kill[sid] = float(rec.get("reward_team_kill", 0.0) or 0.0)
+                        self._reward_slot_team_death[sid] = float(rec.get("reward_team_death", 0.0) or 0.0)
+                        self._reward_slot_team_cp[sid] = float(rec.get("reward_team_cp", 0.0) or 0.0)
+                        self._reward_slot_healing_recovered[sid] = float(rec.get("reward_healing_recovered", 0.0) or 0.0)
+                    else:
+                        self._reward_slot_total[sid] = 0.0
+                        self._reward_slot_individual_total[sid] = 0.0
+                        self._reward_slot_team_total[sid] = 0.0
+                        self._reward_slot_hp[sid] = 0.0
+                        self._reward_slot_kill_individual[sid] = 0.0
+                        self._reward_slot_damage_dealt_individual[sid] = 0.0
+                        self._reward_slot_damage_taken_penalty[sid] = 0.0
+                        self._reward_slot_contested_cp_individual[sid] = 0.0
+                        self._reward_slot_team_kill[sid] = 0.0
+                        self._reward_slot_team_death[sid] = 0.0
+                        self._reward_slot_team_cp[sid] = 0.0
+                        self._reward_slot_healing_recovered[sid] = 0.0
+        except Exception:
+            pass
+
         # If lineage info exists, record parent->child edge and update offspring counts.
         if parent_id is not None:
+            if int(parent_id) == int(agent_id):
+                self._anomaly(f"birth: self-parent edge for agent_id={agent_id}")
+                return
+            if int(parent_id) not in self._life:
+                self._anomaly(f"birth: missing parent life record for parent_id={parent_id}, child_id={agent_id}")
+                return
             self._offspring_count[int(parent_id)] = int(self._offspring_count.get(int(parent_id), 0)) + 1
+            self._lineage_edge_count[int(parent_id)] = int(self._lineage_edge_count.get(int(parent_id), 0)) + 1
             self._append_csv_rows(
                 self.lineage_edges_path,
-                fieldnames=["tick", "parent_id", "child_id"],
-                rows=[{"tick": int(tick), "parent_id": int(parent_id), "child_id": int(agent_id)}],
+                fieldnames=[
+                    "tick",
+                    "parent_id",
+                    "child_id",
+                    "parent_unit_type",
+                    "child_unit_type",
+                    "parent_team",
+                    "spawn_reason",
+                    "parent_generation",
+                    "child_generation",
+                    "mutation_flag",
+                    "rare_mutation",
+                    "mutation_delta_hp",
+                    "mutation_delta_atk",
+                    "mutation_delta_vis",
+                ],
+                rows=[{
+                    "tick": int(tick),
+                    "parent_id": int(parent_id),
+                    "child_id": int(agent_id),
+                    "parent_unit_type": (int(parent_unit_type) if parent_unit_type is not None else ""),
+                    "child_unit_type": int(unit_type),
+                    "parent_team": (int(parent_team) if parent_team is not None else ""),
+                    "spawn_reason": str(spawn_reason or notes),
+                    "parent_generation": (int(parent_generation) if parent_generation is not None else ""),
+                    "child_generation": (int(generation) if generation is not None else ""),
+                    "mutation_flag": int(bool(mutation_flag)),
+                    "rare_mutation": int(bool(rare_mutation)),
+                    "mutation_delta_hp": float(mutation_delta_hp or 0.0),
+                    "mutation_delta_atk": float(mutation_delta_atk or 0.0),
+                    "mutation_delta_vis": int(mutation_delta_vis or 0),
+                }],
+                strict_schema=True,
             )
 
         # Optionally emit a birth event.
@@ -2184,8 +2634,110 @@ class TelemetrySession:
                 "team": int(team),
                 "unit_type": int(unit_type),
                 "parent_id": (int(parent_id) if parent_id is not None else None),
+                "spawn_reason": str(spawn_reason or notes),
+                "parent_unit_type": (int(parent_unit_type) if parent_unit_type is not None else None),
+                "parent_team": (int(parent_team) if parent_team is not None else None),
+                "parent_generation": (int(parent_generation) if parent_generation is not None else None),
+                "generation": (int(generation) if generation is not None else None),
+                "mutation_flag": bool(mutation_flag),
+                "rare_mutation": bool(rare_mutation),
+                "mutation_delta_hp": float(mutation_delta_hp or 0.0),
+                "mutation_delta_atk": float(mutation_delta_atk or 0.0),
+                "mutation_delta_vis": int(mutation_delta_vis or 0),
                 "notes": str(notes),
             })
+
+    def record_ppo_reward_components_by_slot(
+        self,
+        tick: int,
+        slot_ids,
+        reward_total,
+        reward_hp,
+        reward_kill_individual,
+        reward_damage_dealt_individual,
+        reward_damage_taken_penalty,
+        reward_contested_cp_individual,
+        reward_team_kill,
+        reward_team_death,
+        reward_team_cp,
+        reward_healing_recovered,
+    ) -> None:
+        """
+        Accumulate PPO reward categories by live registry slot.
+
+        Important:
+        - This method stays on-device (CPU/CUDA) and uses index_add_.
+        - No per-agent Python loop in the hot path.
+        - Persistent agent_id rows are materialized later via slot freeze/snapshot.
+        """
+        if not self.enabled:
+            return
+
+        reg = getattr(self, "_registry", None)
+        if reg is None or not hasattr(reg, "agent_data"):
+            return
+
+        try:
+            import torch
+        except Exception:
+            return
+
+        device = reg.agent_data.device
+        n_slots = int(reg.agent_data.shape[0])
+        self._ensure_reward_slot_tensors(n_slots=n_slots, device=device)
+
+        s = slot_ids
+        if s is None:
+            return
+
+        if not isinstance(s, torch.Tensor):
+            s = torch.as_tensor(s, device=device, dtype=torch.long)
+        else:
+            s = s.to(device=device, dtype=torch.long)
+
+        s = s.view(-1)
+        if s.numel() == 0:
+            return
+
+        def _vec(x):
+            if isinstance(x, torch.Tensor):
+                y = x.to(device=device, dtype=torch.float32)
+            else:
+                y = torch.as_tensor(x, device=device, dtype=torch.float32)
+            return y.view(-1)
+
+        rt = _vec(reward_total)
+        rh = _vec(reward_hp)
+        rk = _vec(reward_kill_individual)
+        rdd = _vec(reward_damage_dealt_individual)
+        rdt = _vec(reward_damage_taken_penalty)
+        rcp = _vec(reward_contested_cp_individual)
+        rtk = _vec(reward_team_kill)
+        rtd = _vec(reward_team_death)
+        rtcp = _vec(reward_team_cp)
+        rhr = _vec(reward_healing_recovered)
+
+        n = int(s.numel())
+        tensors = (rt, rh, rk, rdd, rdt, rcp, rtk, rtd, rtcp, rhr)
+        if any(int(t.numel()) != n for t in tensors):
+            self._anomaly("record_ppo_reward_components_by_slot: length mismatch")
+            return
+
+        rind = rk + rdd + rdt + rcp + rhr
+        rteam = rtk + rtd + rtcp
+
+        self._reward_slot_total.index_add_(0, s, rt)
+        self._reward_slot_individual_total.index_add_(0, s, rind)
+        self._reward_slot_team_total.index_add_(0, s, rteam)
+        self._reward_slot_hp.index_add_(0, s, rh)
+        self._reward_slot_kill_individual.index_add_(0, s, rk)
+        self._reward_slot_damage_dealt_individual.index_add_(0, s, rdd)
+        self._reward_slot_damage_taken_penalty.index_add_(0, s, rdt)
+        self._reward_slot_contested_cp_individual.index_add_(0, s, rcp)
+        self._reward_slot_team_kill.index_add_(0, s, rtk)
+        self._reward_slot_team_death.index_add_(0, s, rtd)
+        self._reward_slot_team_cp.index_add_(0, s, rtcp)
+        self._reward_slot_healing_recovered.index_add_(0, s, rhr)
 
     def ingest_spawn_meta(self, meta: List[Dict[str, Any]]) -> None:
         """
@@ -2209,6 +2761,12 @@ class TelemetrySession:
             return
 
         for m in meta:
+            required = ("tick", "slot", "agent_id", "team_id", "unit_id", "spawn_reason")
+            missing = [k for k in required if k not in m]
+            if missing:
+                self._anomaly(f"ingest_spawn_meta: missing required keys {missing}")
+                continue
+
             tick = _to_int(m.get("tick"))
             slot = _to_int(m.get("slot"))
             aid = _to_int(m.get("agent_id"))
@@ -2227,12 +2785,20 @@ class TelemetrySession:
                     "team_id": int(team),
                     "team_name": str(team_name),
                     "unit_id": int(unit),
+                    "parent_unit_id": (_to_int(m.get("parent_unit_id")) if m.get("parent_unit_id", None) is not None else ""),
+                    "child_generation": _to_int(m.get("child_generation", 0)),
+                    "spawn_reason": str(m.get("spawn_reason", "respawn")),
                     "spawn_hp": float(m.get("spawn_hp", "")) if m.get("spawn_hp", None) is not None else "",
                     "spawn_atk": float(m.get("spawn_atk", "")) if m.get("spawn_atk", None) is not None else "",
                     "spawn_vis": int(m.get("spawn_vis", 0)) if m.get("spawn_vis", None) is not None else "",
                     "parent_agent_id": (int(parent_id) if parent_id is not None else ""),
                     "cloned": bool(m.get("cloned", False)),
                     "mutation_std": float(m.get("mutation_std", 0.0)),
+                    "mutation_flag": bool(m.get("mutation_flag", False)),
+                    "rare_mutation": bool(m.get("rare_mutation", False)),
+                    "mutation_delta_hp": float(m.get("mutation_delta_hp", 0.0)),
+                    "mutation_delta_atk": float(m.get("mutation_delta_atk", 0.0)),
+                    "mutation_delta_vis": int(m.get("mutation_delta_vis", 0)),
                 })
 
             self.record_birth(
@@ -2244,6 +2810,24 @@ class TelemetrySession:
                 parent_id=parent_id,
                 notes="respawn",
                 allow_existing=False,
+                spawn_reason=str(m.get("spawn_reason", "respawn")),
+                parent_unit_type=(
+                    _to_int(m.get("parent_unit_id")) if m.get("parent_unit_id", None) is not None else None
+                ),
+                parent_team=(
+                    _to_int(m.get("parent_team_id")) if m.get("parent_team_id", None) is not None else None
+                ),
+                parent_generation=(
+                    _to_int(m.get("parent_generation")) if m.get("parent_generation", None) is not None else None
+                ),
+                generation=(
+                    _to_int(m.get("child_generation")) if m.get("child_generation", None) is not None else None
+                ),
+                mutation_flag=bool(m.get("mutation_flag", False)),
+                rare_mutation=bool(m.get("rare_mutation", False)),
+                mutation_delta_hp=float(m.get("mutation_delta_hp", 0.0)),
+                mutation_delta_atk=float(m.get("mutation_delta_atk", 0.0)),
+                mutation_delta_vis=int(m.get("mutation_delta_vis", 0)),
             )
 
             self._maybe_write_agent_static(
@@ -2253,7 +2837,7 @@ class TelemetrySession:
                 team_id=int(team),
                 unit_type=int(unit),
                 parent_id=parent_id,
-                spawn_reason="respawn",
+                spawn_reason=str(m.get("spawn_reason", "respawn")),
             )
 
     def _maybe_write_agent_static(
@@ -2547,27 +3131,22 @@ class TelemetrySession:
         dead_unit: List[int],
         dead_slots: List[int],
         notes: str = "",
+        death_causes: Optional[List[Optional[str]]] = None,
+        killer_ids: Optional[List[Optional[int]]] = None,
+        killer_slots: Optional[List[Optional[int]]] = None,
+        killer_teams: Optional[List[Optional[int]]] = None,
     ) -> None:
         """
-        Record deaths.
+        Record deaths with structured cause/killer metadata.
 
-        Behavior
-        --------
-        - For each dead agent:
-            - ensure birth exists
-            - set death_tick (only if not already set)
-            - emit 'death' event if enabled
-
-        Defensive programming
-        ---------------------
-        If death_tick is already set, we treat it as an anomaly and skip.
-        Duplicate death indicates:
-        - engine double-counting
-        - reuse of agent_id incorrectly
-        - or telemetry lifecycle bug
+        Guardrail:
+        - We keep legacy root dead_agents_log.csv untouched.
+        - Rich death rows go to telemetry/dead_agents_log_detailed.csv.
         """
         if not self.enabled:
             return
+
+        detailed_rows: List[Dict[str, Any]] = []
 
         for i, did in enumerate(dead_ids):
             self._require_birth(did, "death")
@@ -2579,11 +3158,11 @@ class TelemetrySession:
 
             rec["death_tick"] = int(tick)
 
+            sid = int(dead_slots[i]) if i < len(dead_slots) else None
+
             # Freeze final movement totals into the life record.
-            # This protects correctness if the registry slot is later reused for a new agent.
             if self.log_moves:
                 try:
-                    sid = int(dead_slots[i]) if i < len(dead_slots) else None
                     if sid is not None and getattr(self, "_move_slot_attempted", None) is not None:
                         if 0 <= sid < int(self._move_slot_attempted.numel()):
                             rec["moves_attempted"] = int(self._move_slot_attempted[sid].item())
@@ -2599,17 +3178,100 @@ class TelemetrySession:
                 except Exception:
                     pass
 
+            # Freeze final reward-category totals into the life record.
+            try:
+                if sid is not None and getattr(self, "_reward_slot_total", None) is not None:
+                    if 0 <= sid < int(self._reward_slot_total.numel()):
+                        rec["reward_total"] = float(self._reward_slot_total[sid].item())
+                        rec["reward_individual_total"] = float(self._reward_slot_individual_total[sid].item())
+                        rec["reward_team_total"] = float(self._reward_slot_team_total[sid].item())
+                        rec["reward_hp"] = float(self._reward_slot_hp[sid].item())
+                        rec["reward_kill_individual"] = float(self._reward_slot_kill_individual[sid].item())
+                        rec["reward_damage_dealt_individual"] = float(self._reward_slot_damage_dealt_individual[sid].item())
+                        rec["reward_damage_taken_penalty"] = float(self._reward_slot_damage_taken_penalty[sid].item())
+                        rec["reward_contested_cp_individual"] = float(self._reward_slot_contested_cp_individual[sid].item())
+                        rec["reward_team_kill"] = float(self._reward_slot_team_kill[sid].item())
+                        rec["reward_team_death"] = float(self._reward_slot_team_death[sid].item())
+                        rec["reward_team_cp"] = float(self._reward_slot_team_cp[sid].item())
+                        rec["reward_healing_recovered"] = float(self._reward_slot_healing_recovered[sid].item())
+            except Exception:
+                pass
+
+            cause_val = None
+            if death_causes is not None and i < len(death_causes):
+                v = death_causes[i]
+                if v is not None and str(v).strip() != "":
+                    cause_val = str(v).strip()
+                    rec["death_cause"] = cause_val
+
+            killer_id_val = None
+            if killer_ids is not None and i < len(killer_ids):
+                v = killer_ids[i]
+                if v is not None:
+                    killer_id_val = int(v)
+                    rec["killer_id"] = killer_id_val
+
+            killer_slot_val = None
+            if killer_slots is not None and i < len(killer_slots):
+                v = killer_slots[i]
+                if v is not None:
+                    killer_slot_val = int(v)
+                    rec["killer_slot"] = killer_slot_val
+
+            killer_team_val = None
+            if killer_teams is not None and i < len(killer_teams):
+                v = killer_teams[i]
+                if v is not None:
+                    killer_team_val = int(v)
+                    rec["killer_team"] = killer_team_val
+
+            detailed_rows.append({
+                "tick": int(tick),
+                "agent_id": int(did),
+                "slot_id": sid if sid is not None else "",
+                "team": int(dead_team[i]) if i < len(dead_team) else "",
+                "unit_type": int(dead_unit[i]) if i < len(dead_unit) else "",
+                "death_cause": cause_val or "",
+                "killer_id": killer_id_val if killer_id_val is not None else "",
+                "killer_slot": killer_slot_val if killer_slot_val is not None else "",
+                "killer_team": killer_team_val if killer_team_val is not None else "",
+                "notes": str(notes),
+            })
+
             if self.log_deaths:
                 self._emit_event({
                     "schema_version": self._event_schema_version_int(),
                     "tick": int(tick),
                     "type": "death",
                     "agent_id": int(did),
-                    "slot_id": int(dead_slots[i]) if i < len(dead_slots) else None,
+                    "slot_id": sid,
                     "team": int(dead_team[i]) if i < len(dead_team) else None,
                     "unit_type": int(dead_unit[i]) if i < len(dead_unit) else None,
+                    "death_cause": cause_val,
+                    "killer_id": killer_id_val,
+                    "killer_slot": killer_slot_val,
+                    "killer_team": killer_team_val,
                     "notes": str(notes),
                 })
+
+        if detailed_rows:
+            self._append_csv_rows(
+                self.dead_agents_detailed_path,
+                fieldnames=[
+                    "tick",
+                    "agent_id",
+                    "slot_id",
+                    "team",
+                    "unit_type",
+                    "death_cause",
+                    "killer_id",
+                    "killer_slot",
+                    "killer_team",
+                    "notes",
+                ],
+                rows=detailed_rows,
+                strict_schema=True,
+            )
 
     # =============================================================================
     # Tick lifecycle hooks
@@ -2761,4 +3423,3 @@ class TelemetrySession:
         if errors:
             print("[telemetry] Close encountered errors:\n  - " + "\n  - ".join(errors))
     # =============================================================================
-

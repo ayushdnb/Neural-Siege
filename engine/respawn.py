@@ -212,26 +212,17 @@ class RespawnCfg:
     rare_mutation_inherited_brain_noise_enable: bool = field(default_factory=lambda: bool(getattr(config, "RESPAWN_RARE_MUTATION_INHERITED_BRAIN_NOISE_ENABLE", False)))
     rare_mutation_inherited_brain_noise_std: float = field(default_factory=lambda: float(getattr(config, "RESPAWN_RARE_MUTATION_INHERITED_BRAIN_NOISE_STD", 0.20)))
 
-    parent_selection_mode: str = field(default_factory=lambda: str(getattr(config, "RESPAWN_PARENT_SELECTION_MODE", "random")))
+    parent_selection_mode: str = field(default_factory=lambda: str(getattr(config, "RESPAWN_PARENT_SELECTION_MODE", "topk_weighted")).strip().lower())
     parent_selection_topk_frac: float = field(default_factory=lambda: float(getattr(config, "RESPAWN_PARENT_SELECTION_TOPK_FRAC", 0.25)))
     parent_selection_score_power: float = field(default_factory=lambda: float(getattr(config, "RESPAWN_PARENT_SELECTION_SCORE_POWER", 1.0)))
 
     spawn_location_mode: str = field(default_factory=lambda: str(getattr(config, "RESPAWN_SPAWN_LOCATION_MODE", "uniform")))
     spawn_near_parent_radius: int = field(default_factory=lambda: int(getattr(config, "RESPAWN_SPAWN_NEAR_PARENT_RADIUS", max(1, int(getattr(config, "RESPAWN_JITTER_RADIUS", 1))))))
-
-
-# ----------------------------------------------------------------------
-# Global counter for rare mutation events
-# ----------------------------------------------------------------------
-_respawn_counter = 0
-# This is a module-level counter shared across all controller instances.
-# Meaning:
-#   - If you create a new RespawnController, the counter does NOT reset.
-#   - Rare mutation triggers on every 1000th respawn globally across teams.
-# Rationale:
-#   - Provides occasional "punctuated" variability, akin to rare genetic mutation.
-# Caveat:
-#   - Global state can be surprising in multi-simulation or multi-thread usage.
+    child_unit_mode: str = field(
+        default_factory=lambda: str(
+            getattr(config, "RESPAWN_CHILD_UNIT_MODE", "inherit_parent_on_clone")
+        ).strip().lower()
+    )
 
 
 # ----------------------------------------------------------------------
@@ -760,6 +751,42 @@ def _choose_unit(cfg: RespawnCfg) -> int:
     return cfg.unit_archer if random.random() < cfg.spawn_archer_ratio else cfg.unit_soldier
 
 
+def _choose_unit_for_spawn(
+    cfg: RespawnCfg,
+    data: torch.Tensor,
+    *,
+    use_clone: bool,
+    parent_slot: Optional[int],
+) -> int:
+    """
+    Resolve child unit type deterministically from configured reproduction semantics.
+
+    Supported modes:
+      - "inherit_parent_on_clone" (default):
+            clone path inherits parent unit exactly;
+            fresh/non-clone path uses random spawn ratio.
+      - "random":
+            always uses random spawn ratio.
+    """
+    mode = str(getattr(cfg, "child_unit_mode", "inherit_parent_on_clone")).strip().lower()
+
+    if mode not in ("inherit_parent_on_clone", "inherit_parent", "clone_inherits_unit", "random"):
+        raise RuntimeError(f"[respawn] Unsupported child_unit_mode={mode!r}")
+
+    if use_clone and mode in ("inherit_parent_on_clone", "inherit_parent", "clone_inherits_unit"):
+        if parent_slot is None:
+            raise RuntimeError("[respawn] clone child_unit_mode requires a concrete parent slot")
+        if int(parent_slot) < 0 or int(parent_slot) >= int(data.shape[0]):
+            raise RuntimeError(f"[respawn] parent slot out of range for unit inheritance: {parent_slot}")
+
+        parent_unit = int(round(float(data[int(parent_slot), COL_UNIT].item())))
+        if parent_unit not in (int(cfg.unit_soldier), int(cfg.unit_archer)):
+            raise RuntimeError(f"[respawn] unsupported parent unit for inheritance: {parent_unit}")
+        return int(parent_unit)
+
+    return int(_choose_unit(cfg))
+
+
 def _unit_stats(unit_id: int, cfg: RespawnCfg) -> Tuple[float, float, int]:
     """Return (hp, atk, vision_range) for the given unit type.
 
@@ -793,6 +820,7 @@ def _write_agent_to_registry(
     atk: float,
     vision: int,
     brain: torch.nn.Module,
+    generation: int = 0,
 ) -> None:
     """Fill the registry tensors and brain list for a newly spawned agent.
 
@@ -865,6 +893,8 @@ def _write_agent_to_registry(
     reg.brains[slot] = brain
     if hasattr(reg, "optimizers"):
         reg.optimizers[slot] = None
+    if hasattr(reg, "generations") and 0 <= int(slot) < len(reg.generations):
+        reg.generations[slot] = int(generation)
 
 
 # ----------------------------------------------------------------------
@@ -903,8 +933,7 @@ def _pick_parent_slot(parents: torch.Tensor, data: torch.Tensor, cfg: RespawnCfg
         chosen_local = random.choices(cand_idx, weights=weights, k=1)[0]
         return int(parents[chosen_local].item())
 
-    # Unknown mode: safe fallback to baseline random.
-    return int(parents[random.randrange(n)].item())
+    raise RuntimeError(f"[respawn] unsupported parent_selection_mode={mode!r}")
 
 
 def _apply_rare_physical_drift(hp0: float, atk0: float, vision0: int, cfg: RespawnCfg) -> Tuple[float, float, int]:
@@ -942,6 +971,7 @@ def _respawn_some(
     tick: int,
     meta_out: Optional[List[Dict[str, object]]] = None,
     controller: Optional["RespawnController"] = None,
+    spawn_reason: str = "respawn",
 ) -> int:
     """
     Attempt to spawn up to `count` agents of the given team.
@@ -968,7 +998,6 @@ def _respawn_some(
       - avoids autograd memory overhead,
       - prevents accidental graph creation if tensors are on GPU.
     """
-    global _respawn_counter
 
     # Trivial guard: do nothing if count is non-positive.
     if count <= 0:
@@ -1022,9 +1051,34 @@ def _respawn_some(
             # This prevents repeated failures and wasted computation.
             break
 
-        # Choose unit type and get base stats.
-        unit_id = _choose_unit(cfg)
-        hp0, atk0, vision0 = _unit_stats(unit_id, cfg)
+        parent_unit_id: Optional[int] = None
+        parent_team_id: Optional[int] = None
+        parent_generation: Optional[int] = None
+        if use_clone:
+            if pj is None:
+                raise RuntimeError("[respawn] clone path entered without parent slot")
+            if int(pj) < 0 or int(pj) >= int(data.shape[0]):
+                raise RuntimeError(f"[respawn] picked parent slot out of range: {pj}")
+            if float(data[pj, COL_ALIVE].item()) <= 0.5:
+                raise RuntimeError(f"[respawn] picked parent slot is not alive: {pj}")
+            if float(data[pj, COL_TEAM].item()) != float(team_id):
+                raise RuntimeError(
+                    f"[respawn] parent team mismatch: parent_team={float(data[pj, COL_TEAM].item())} child_team={float(team_id)}"
+                )
+            parent_unit_id = int(round(float(data[pj, COL_UNIT].item())))
+            parent_team_id = int(round(float(data[pj, COL_TEAM].item())))
+            if hasattr(reg, "generations") and 0 <= int(pj) < len(reg.generations):
+                parent_generation = int(reg.generations[pj])
+
+        # Choose unit type using explicit child-unit semantics.
+        unit_id = _choose_unit_for_spawn(
+            cfg,
+            data,
+            use_clone=bool(use_clone),
+            parent_slot=(int(pj) if pj is not None else None),
+        )
+        hp_base, atk_base, vision_base = _unit_stats(unit_id, cfg)
+        hp0, atk0, vision0 = hp_base, atk_base, vision_base
 
         # Rare mutation trigger path:
         # - legacy behavior (every 1000th respawn globally) is preserved unless
@@ -1033,8 +1087,16 @@ def _respawn_some(
         if bool(getattr(cfg, "rare_mutation_tick_window_enable", False)) and controller is not None:
             rare_mutation = bool(controller._consume_pending_rare_mutation_ticket())
         else:
-            _respawn_counter += 1
-            if _respawn_counter % 1000 == 0:
+            if controller is not None:
+                controller._legacy_respawn_counter = int(getattr(controller, "_legacy_respawn_counter", 0)) + 1
+                legacy_counter = int(controller._legacy_respawn_counter)
+            else:
+                # Defensive fallback for direct/test invocation without a controller.
+                cur = int(getattr(_respawn_some, "_legacy_respawn_counter", 0))
+                setattr(_respawn_some, "_legacy_respawn_counter", cur + 1)
+                legacy_counter = int(getattr(_respawn_some, "_legacy_respawn_counter", 0))
+
+            if legacy_counter % 1000 == 0:
                 rare_mutation = True
                 hp0 *= (1.0 + random.uniform(0.5, 2.0))
                 atk0 *= (1.0 + random.uniform(0.5, 2.0))
@@ -1075,8 +1137,32 @@ def _respawn_some(
             # Create a brand-new brain using team-aware assignment rules.
             brain = _new_brain(reg.device, team_id=team_id)
 
+        mutation_delta_hp = float(hp0) - float(hp_base)
+        mutation_delta_atk = float(atk0) - float(atk_base)
+        mutation_delta_vis = int(vision0) - int(vision_base)
+        mutation_flag = bool(
+            (use_clone and float(cfg.mutation_std) > 0.0)
+            or bool(rare_mutation)
+            or abs(mutation_delta_hp) > 0.0
+            or abs(mutation_delta_atk) > 0.0
+            or int(mutation_delta_vis) != 0
+        )
+        child_generation = int(parent_generation + 1) if (use_clone and parent_generation is not None) else 0
+
         # Commit agent state into registry tensors and brain storage.
-        _write_agent_to_registry(reg, slot, team_id, x, y, unit_id, hp0, atk0, vision0, brain)
+        _write_agent_to_registry(
+            reg,
+            slot,
+            team_id,
+            x,
+            y,
+            unit_id,
+            hp0,
+            atk0,
+            vision0,
+            brain,
+            generation=child_generation,
+        )
 
         # Telemetry hook: capture spawn metadata without affecting simulation.
         #
@@ -1099,12 +1185,20 @@ def _respawn_some(
                 "agent_id": int(child_aid),
                 "team_id": float(team_id),
                 "unit_id": int(unit_id),
+                "spawn_reason": str(spawn_reason),
+                "spawn_origin": ("clone" if use_clone else "fresh"),
                 "x": int(x),
                 "y": int(y),
                 "cloned": bool(use_clone),
                 "parent_slot": int(pj) if use_clone else None,
                 "parent_agent_id": int(parent_aid) if parent_aid is not None else None,
+                "parent_unit_id": int(parent_unit_id) if parent_unit_id is not None else None,
+                "parent_team_id": int(parent_team_id) if parent_team_id is not None else None,
+                "parent_generation": int(parent_generation) if parent_generation is not None else None,
+                "child_generation": int(child_generation),
+                "unit_inherited_from_parent": bool(use_clone and parent_unit_id is not None and int(parent_unit_id) == int(unit_id)),
                 "mutation_std": float(cfg.mutation_std),
+                "mutation_flag": bool(mutation_flag),
                 # Additive observability fields (no behavior impact)
                 "rare_mutation": bool(rare_mutation),
                 "rare_mutation_trigger_tick_window": bool(getattr(cfg, "rare_mutation_tick_window_enable", False)),
@@ -1114,6 +1208,12 @@ def _respawn_some(
                 "spawn_hp": float(hp0),
                 "spawn_atk": float(atk0),
                 "spawn_vis": int(vision0),
+                "base_hp": float(hp_base),
+                "base_atk": float(atk_base),
+                "base_vis": int(vision_base),
+                "mutation_delta_hp": float(mutation_delta_hp),
+                "mutation_delta_atk": float(mutation_delta_atk),
+                "mutation_delta_vis": int(mutation_delta_vis),
             })
 
         # Update grid to reflect the spawned agent.
@@ -1175,6 +1275,10 @@ class RespawnController:
         # Rare-mutation ticket state (tick-window mode; checkpoint-safe via checkpointing.py).
         self._rare_mutation_pending_ticket = 0  # int for easy serialization
         self._rare_mutation_last_window_idx = -1
+
+        # Legacy every-Nth anomaly counter kept controller-scoped so fresh runs/controllers
+        # do not inherit module-global state.
+        self._legacy_respawn_counter = 0
 
         # Per-step metadata for all spawns performed in the most recent step.
         self.last_spawn_meta: List[Dict[str, object]] = []
@@ -1259,7 +1363,8 @@ class RespawnController:
                 self.cfg,
                 tick,
                 self.last_spawn_meta,
-                controller=self
+                controller=self,
+                spawn_reason="floor",
             )
             spawned_r += spawned
             if counts.red + spawned >= self.cfg.floor_per_team:
@@ -1273,7 +1378,8 @@ class RespawnController:
                 self.cfg,
                 tick,
                 self.last_spawn_meta,
-                controller=self
+                controller=self,
+                spawn_reason="floor",
             )
             spawned_b += spawned
             if counts.blue + spawned >= self.cfg.floor_per_team:
@@ -1297,7 +1403,8 @@ class RespawnController:
                     self.cfg,
                     tick,
                     self.last_spawn_meta,
-                    controller=self
+                    controller=self,
+                    spawn_reason="periodic",
                 )
                 spawned_b += _respawn_some(
                     reg, grid, TEAM_BLUE_ID,
@@ -1305,7 +1412,8 @@ class RespawnController:
                     self.cfg,
                     tick,
                     self.last_spawn_meta,
-                    controller=self
+                    controller=self,
+                    spawn_reason="periodic",
                 )
 
         return spawned_r, spawned_b
@@ -1349,4 +1457,4 @@ def respawn_tick(reg: AgentsRegistry, grid: torch.Tensor, cfg: RespawnCfg) -> No
     """
     controller = RespawnController(cfg)
     controller.step(0, reg, grid)  # tick number is not critical for one-off calls
-    # Note: step returns counts, but we ignore them to match old API.
+    # Note: step returns counts, but we ignore them to match the old API.

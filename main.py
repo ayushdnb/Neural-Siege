@@ -1,4 +1,3 @@
-
 """
 Infinite War Simulation – Main entry point
 ==========================================
@@ -213,8 +212,55 @@ def _config_snapshot() -> dict:
         "SPAWN": {
             "SPAWN_MODE": str(getattr(config, "SPAWN_MODE", "uniform")),
             "SPAWN_ARCHER_RATIO": float(getattr(config, "SPAWN_ARCHER_RATIO", 0.4)),
+            "RESPAWN_CHILD_UNIT_MODE": str(getattr(config, "RESPAWN_CHILD_UNIT_MODE", "inherit_parent_on_clone")),
+            "RESPAWN_PARENT_SELECTION_MODE": str(getattr(config, "RESPAWN_PARENT_SELECTION_MODE", "random")),
         },
         "ARCHER_LOS_BLOCKS_WALLS": bool(getattr(config, "ARCHER_LOS_BLOCKS_WALLS", False)),
+    }
+
+
+def _telemetry_schema_manifest(grid: torch.Tensor, zones) -> dict:
+    return {
+        "schema_version": str(getattr(config, "TELEMETRY_SCHEMA_VERSION", "v2")),
+        "lineage_fields": [
+            "tick",
+            "parent_id",
+            "child_id",
+            "parent_unit_type",
+            "child_unit_type",
+            "parent_team",
+            "spawn_reason",
+            "parent_generation",
+            "child_generation",
+            "mutation_flag",
+            "rare_mutation",
+            "mutation_delta_hp",
+            "mutation_delta_atk",
+            "mutation_delta_vis",
+        ],
+        "reward_fields": [
+            "reward_total",
+            "reward_individual_total",
+            "reward_team_total",
+            "reward_hp",
+            "reward_kill_individual",
+            "reward_damage_dealt_individual",
+            "reward_damage_taken_penalty",
+            "reward_contested_cp_individual",
+            "reward_team_kill",
+            "reward_team_death",
+            "reward_team_cp",
+            "reward_healing_recovered",
+        ],
+        "death_causes": ["combat", "metabolism", "environmental", "collision", "unknown"],
+        "mechanics": {
+            "archer_los_blocks_walls": bool(getattr(config, "ARCHER_LOS_BLOCKS_WALLS", False)),
+            "metabolism_enabled": bool(getattr(config, "METABOLISM_ENABLED", True)),
+            "heal_zones_enabled": bool(zones is not None and getattr(zones, "heal_mask", None) is not None),
+            "cp_zone_count": int(len(getattr(zones, "cp_masks", []) or [])) if zones is not None else 0,
+            "respawn_child_unit_mode": str(getattr(config, "RESPAWN_CHILD_UNIT_MODE", "inherit_parent_on_clone")),
+            "respawn_parent_selection_mode": str(getattr(config, "RESPAWN_PARENT_SELECTION_MODE", "random")),
+        },
     }
 
 
@@ -785,6 +831,11 @@ def main() -> None:
             stats=stats,
             device=torch.device(config.TORCH_DEVICE),
         )
+        ckpt_tick = int(ckpt.get("meta", {}).get("tick", stats.tick))
+        if int(stats.tick) != ckpt_tick:
+            raise RuntimeError(
+                f"[main] checkpoint tick mismatch after restore: stats.tick={int(stats.tick)} manifest_tick={ckpt_tick}"
+            )
         print("[main] Runtime state restored from checkpoint.")
 
     # ------------------------------------------------------------------
@@ -846,6 +897,12 @@ def main() -> None:
                     stats=stats,
                     ppo_runtime=getattr(engine, "_ppo", None),
                 )
+
+                telemetry_manifest = _telemetry_schema_manifest(grid, zones)
+                if resume_continuity_active and ckpt is not None:
+                    telemetry.validate_schema_manifest_compat(telemetry_manifest)
+                else:
+                    telemetry.write_schema_manifest(telemetry_manifest)
 
                 # Resume-in-place: preserve original run_meta.json by default (avoid overwrite).
                 if not (resume_continuity_active and ckpt is not None):
@@ -1006,7 +1063,27 @@ def main() -> None:
 
     finally:
         # ------------------------------------------------------------------
-        # 10) On-exit checkpoint
+        # 10) Persist final death logs
+        # ------------------------------------------------------------------
+        try:
+            deaths = stats.drain_dead_log()
+            if deaths and rw is not None:
+                rw.write_deaths(deaths)
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # 11) Close telemetry first so final snapshots/events reach the same horizon
+        #     before checkpoint + summary are frozen.
+        # ------------------------------------------------------------------
+        try:
+            if telemetry is not None:
+                telemetry.close()
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # 12) On-exit checkpoint
         # ------------------------------------------------------------------
         if ckpt_mgr is not None and bool(getattr(config, "CHECKPOINT_ON_EXIT", True)):
             try:
@@ -1017,17 +1094,7 @@ def main() -> None:
                 print("[checkpoint] on-exit FAILED:", type(ex).__name__, ex)
 
         # ------------------------------------------------------------------
-        # 11) Persist final death logs
-        # ------------------------------------------------------------------
-        try:
-            deaths = stats.drain_dead_log()
-            if deaths and rw is not None:
-                rw.write_deaths(deaths)
-        except Exception:
-            pass
-
-        # ------------------------------------------------------------------
-        # 12) Final summary (atomic JSON)
+        # 13) Final summary (atomic JSON)
         # ------------------------------------------------------------------
         try:
             summary = {
@@ -1052,15 +1119,6 @@ def main() -> None:
                     )
             except Exception:
                 pass
-
-        # ------------------------------------------------------------------
-        # 13) Close telemetry (flush last events)
-        # ------------------------------------------------------------------
-        try:
-            if telemetry is not None:
-                telemetry.close()
-        except Exception:
-            pass
 
         # ------------------------------------------------------------------
         # 14) Shutdown background writer and recorder

@@ -1028,7 +1028,7 @@ PPO_HP_REWARD_MODE         = _env_str("FWS_PPO_HP_REWARD_MODE", "threshold_ramp"
 # HP percentage threshold used by threshold-ramp HP reward mode.
 # Env: FWS_PPO_HP_REWARD_THRESHOLD
 # Example: 0.60 => no HP PPO reward at <=60% HP, smooth ramp above it.
-PPO_HP_REWARD_THRESHOLD    = _env_float("FWS_PPO_HP_REWARD_THRESHOLD", 0.60)
+PPO_HP_REWARD_THRESHOLD    = _env_float("FWS_PPO_HP_REWARD_THRESHOLD", 0.40)
 
 # Individual PPO reward for damage dealt (dense combat shaping, per-agent only).
 # Env: FWS_PPO_REW_DMG_DEALT_AGENT
@@ -1073,7 +1073,7 @@ PPO_RESET_LOG     = _env_bool("FWS_PPO_RESET_LOG", False)
 # PPO rollout window length in ticks (trajectory horizon before update).
 # Env: FWS_PPO_TICKS
 # Larger windows => more temporal context, more memory/latency before updates.
-PPO_WINDOW_TICKS  = _env_int("FWS_PPO_TICKS", 512)
+PPO_WINDOW_TICKS  = _env_int("FWS_PPO_TICKS", 128)
 
 # Learning rate.
 # Env: FWS_PPO_LR

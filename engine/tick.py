@@ -124,6 +124,9 @@ class TickMetrics:
     # Death breakdown (explicit semantics; helps telemetry/forensics)
     deaths_combat: int = 0
     deaths_metabolism: int = 0
+    deaths_environmental: int = 0
+    deaths_collision: int = 0
+    deaths_unknown: int = 0
 
     tick: int = 0
     cp_red_tick: float = 0.0
@@ -621,6 +624,7 @@ class TickEngine:
         metrics: TickMetrics,
         credit_kills: bool = True,
         death_cause: str = "unknown",
+        killer_slot_by_victim: Optional[Dict[int, int]] = None,
     ) -> Tuple[int, int]:
         """
         Kill agents indicated by sel (boolean mask or index tensor).
@@ -642,11 +646,52 @@ class TickEngine:
         if dead_idx.numel() == 0:
             return 0, 0
 
+        death_cause = str(death_cause).strip().lower()
+        allowed_death_causes = {"combat", "metabolism", "environmental", "collision", "unknown"}
+        if death_cause not in allowed_death_causes:
+            raise RuntimeError(f"[tick] unsupported death_cause={death_cause!r}")
+
         # Snapshot metadata BEFORE mutation (positions/teams/units/uids are still readable now).
         dead_slots = [int(s) for s in dead_idx.tolist()]
         dead_ids = self._slot_ids_to_agent_uids_list(dead_idx)
         dead_team_list = [int(data[slot, COL_TEAM].item()) for slot in dead_slots]
         dead_unit_list = [int(data[slot, COL_UNIT].item()) for slot in dead_slots]
+
+        # Structured killer alignment for telemetry/death forensics.
+        killer_slots_list: List[Optional[int]] = []
+        killer_ids_list: List[Optional[int]] = []
+        killer_team_list: List[Optional[int]] = []
+
+        if killer_slot_by_victim is not None and len(killer_slot_by_victim) > 0:
+            for dead_slot in dead_slots:
+                ks = killer_slot_by_victim.get(int(dead_slot), None)
+                if ks is None or int(ks) < 0:
+                    killer_slots_list.append(None)
+                    killer_ids_list.append(None)
+                    killer_team_list.append(None)
+                    continue
+
+                ks = int(ks)
+                if ks >= int(data.shape[0]):
+                    raise RuntimeError(f"[tick] killer slot out of range: victim_slot={dead_slot} killer_slot={ks}")
+                if ks == int(dead_slot):
+                    raise RuntimeError(f"[tick] self-kill attribution detected for slot={ks}")
+                if int(data[ks, COL_TEAM].item()) == int(data[int(dead_slot), COL_TEAM].item()):
+                    raise RuntimeError(
+                        f"[tick] friendly-fire killer attribution detected: victim_slot={dead_slot} killer_slot={ks}"
+                    )
+                killer_slots_list.append(ks)
+
+                if hasattr(self.registry, "agent_uids"):
+                    killer_ids_list.append(int(self.registry.agent_uids[ks].item()))
+                else:
+                    killer_ids_list.append(int(data[ks, COL_AGENT_ID].item()))
+
+                killer_team_list.append(int(data[ks, COL_TEAM].item()))
+        else:
+            killer_slots_list = [None] * len(dead_slots)
+            killer_ids_list = [None] * len(dead_slots)
+            killer_team_list = [None] * len(dead_slots)
 
         # Count deaths by team encoding (read before ALIVE zeroing).
         dead_team = data[dead_idx, COL_TEAM]
@@ -671,32 +716,37 @@ class TickEngine:
         # post-death readers do not observe "death event emitted but agent still alive on grid".
         gx = self._as_long(data[dead_idx, COL_X])
         gy = self._as_long(data[dead_idx, COL_Y])
-                # Back-compat structured death log for ResultsWriter -> dead_agents_log.csv.
-        # Legacy schema requires a killer_team field, so we only emit entries for
-        # combat deaths where kill credit is enabled (team-level attribution is known).
-        if death_cause == "combat" and credit_kills:
-            try:
-                rec_fn = getattr(self.stats, "record_death_entry", None)
-                if callable(rec_fn):
-                    n = min(len(dead_ids), len(dead_team_list), int(gx.numel()), int(gy.numel()))
-                    for i in range(n):
-                        victim_team = int(dead_team_list[i])
-                        if victim_team not in (2, 3):
-                            continue  # defensive: unknown team encoding
 
-                        # Team-level attribution only (legacy CSV stores killer_team, not killer_id)
-                        killer_team = 3 if victim_team == 2 else 2
+        # Root structured death log for ResultsWriter -> dead_agents_log.csv.
+        # For clean runs from tick 0, emit explicit cause + real killer metadata when known.
+        try:
+            rec_fn = getattr(self.stats, "record_death_entry", None)
+            if callable(rec_fn):
+                n = min(len(dead_ids), len(dead_team_list), int(gx.numel()), int(gy.numel()))
+                for i in range(n):
+                    victim_team = int(dead_team_list[i])
+                    if victim_team not in (2, 3):
+                        continue
 
-                        rec_fn(
-                            agent_id=int(dead_ids[i]),
-                            team_id_val=float(victim_team),
-                            x=int(gx[i].item()),
-                            y=int(gy[i].item()),
-                            killer_team_id_val=float(killer_team),
-                        )
-            except Exception:
-                # Fail-safe: legacy death CSV must never break the simulation tick.
-                pass
+                    killer_team = killer_team_list[i] if i < len(killer_team_list) else None
+                    killer_id = killer_ids_list[i] if i < len(killer_ids_list) else None
+                    killer_slot = killer_slots_list[i] if i < len(killer_slots_list) else None
+
+                    rec_fn(
+                        agent_id=int(dead_ids[i]),
+                        team_id_val=float(victim_team),
+                        x=int(gx[i].item()),
+                        y=int(gy[i].item()),
+                        killer_team_id_val=(float(killer_team) if killer_team in (2, 3) else None),
+                        killer_agent_id=(int(killer_id) if killer_id is not None else None),
+                        killer_slot=(int(killer_slot) if killer_slot is not None else None),
+                        death_cause=str(death_cause),
+                        notes=(f"credit_kills={1 if credit_kills else 0}"),
+                    )
+        except Exception:
+            # Fail-safe: root death CSV must never break the simulation tick.
+            pass
+
         # Clear occupancy / hp / slot-id in grid first (spatial truth for fast queries).
         self.grid[0][gy, gx], self.grid[1][gy, gx], self.grid[2][gy, gx] = self._g0, self._g0, self._gneg
 
@@ -722,6 +772,10 @@ class TickEngine:
                     dead_unit=dead_unit_list,
                     dead_slots=dead_slots,
                     notes=f"cause={death_cause}; credit_kills={1 if credit_kills else 0}",
+                    death_causes=[str(death_cause)] * len(dead_ids),
+                    killer_ids=killer_ids_list,
+                    killer_slots=killer_slots_list,
+                    killer_teams=killer_team_list,
                 )
             except Exception as e:
                 try:
@@ -730,6 +784,16 @@ class TickEngine:
                     pass
 
         metrics.deaths += int(dead_idx.numel())
+        if death_cause == "combat":
+            metrics.deaths_combat += int(dead_idx.numel())
+        elif death_cause == "metabolism":
+            metrics.deaths_metabolism += int(dead_idx.numel())
+        elif death_cause == "environmental":
+            metrics.deaths_environmental += int(dead_idx.numel())
+        elif death_cause == "collision":
+            metrics.deaths_collision += int(dead_idx.numel())
+        else:
+            metrics.deaths_unknown += int(dead_idx.numel())
         return red_deaths, blue_deaths
 
     # -------------------------------------------------------------------------
@@ -1056,6 +1120,17 @@ class TickEngine:
         # This is later indexed for just the participating agents in PPO logging.
         individual_rewards = torch.zeros(self.registry.capacity, device=self.device, dtype=self._data_dt)
 
+        # Reward-category buffers kept separate so telemetry can answer:
+        # "Are agents improving damage dealt / kill reward / CP reward / HP reward over generations?"
+        reward_kill_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+        reward_damage_dealt_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+        reward_damage_taken_penalty = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+        reward_contested_cp_individual = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+        reward_healing_recovered = torch.zeros(self.registry.capacity, device=self.device, dtype=torch.float32)
+
+        # Victim slot -> credited killer slot for combat deaths in this tick.
+        combat_killer_slot_by_victim: Dict[int, int] = {}
+
         # ---------------------------------------------------------------------
         # 4) COMBAT (combat-first semantics)
         # ---------------------------------------------------------------------
@@ -1235,7 +1310,9 @@ class TickEngine:
                                 sk = credited_killers[k_order]
                                 uniq_k, k_counts = torch.unique_consecutive(sk, return_counts=True)
 
-                                individual_rewards[uniq_k] += (k_counts.to(self._data_dt) * reward_val)
+                                reward_add = (k_counts.to(torch.float32) * reward_val)
+                                individual_rewards[uniq_k] += reward_add.to(self._data_dt)
+                                reward_kill_individual[uniq_k] += reward_add
 
                                 # agent_scores keyed by persistent agent id
                                 for killer_slot, cnt in zip(uniq_k.tolist(), k_counts.tolist()):
@@ -1244,6 +1321,9 @@ class TickEngine:
                                     else:
                                         uid = int(data[killer_slot, COL_AGENT_ID].item())
                                     self.agent_scores[uid] += reward_val * float(cnt)
+
+                                for victim_slot, killer_slot in zip(credited_victims.tolist(), credited_killers.tolist()):
+                                    combat_killer_slot_by_victim[int(victim_slot)] = int(killer_slot)
 
                                 # Defer kill-event emission until AFTER damage telemetry (causal ordering).
                                 kill_event_killer_slots = credited_killers
@@ -1266,10 +1346,14 @@ class TickEngine:
                             dmg_a.scatter_add_(0, inv_a, sdmg)
 
                         if ppo_dmg_dealt_coef != 0.0 and uniq_a.numel() > 0:
-                            individual_rewards[uniq_a] += (dmg_a.to(self._data_dt) * float(ppo_dmg_dealt_coef))
+                            dmg_dealt_add = (dmg_a.to(torch.float32) * float(ppo_dmg_dealt_coef))
+                            individual_rewards[uniq_a] += dmg_dealt_add.to(self._data_dt)
+                            reward_damage_dealt_individual[uniq_a] += dmg_dealt_add
 
                         if ppo_dmg_taken_pen != 0.0 and uniq_v.numel() > 0:
-                            individual_rewards[uniq_v] -= (dmg_sum.to(self._data_dt) * float(ppo_dmg_taken_pen))
+                            dmg_taken_pen = (dmg_sum.to(torch.float32) * float(ppo_dmg_taken_pen))
+                            individual_rewards[uniq_v] -= dmg_taken_pen.to(self._data_dt)
+                            reward_damage_taken_penalty[uniq_v] -= dmg_taken_pen
 
                         # Sync grid HP immediately after registry HP mutation (shrink desync window).
                         # This reduces the chance that debug hooks / future readers observe
@@ -1370,8 +1454,8 @@ class TickEngine:
             metrics,
             credit_kills=True,
             death_cause="combat",
+            killer_slot_by_victim=(combat_killer_slot_by_victim if combat_killer_slot_by_victim else None),
         )
-        metrics.deaths_combat += (rD + bD)
         combat_rd += rD
         combat_bd += bD
         self._debug_invariants("post_combat")
@@ -1677,8 +1761,16 @@ class TickEngine:
             # Healing zones
             if self._z_heal is not None and (on_heal := self._z_heal[pos_xy[:, 1], pos_xy[:, 0]]).any():
                 heal_idx = alive_idx[on_heal]
+                hp_before_heal = data[heal_idx, COL_HP].clone()
                 data[heal_idx, COL_HP] = (data[heal_idx, COL_HP] + config.HEAL_RATE).clamp_max(data[heal_idx, COL_HP_MAX])
+                healed_delta = (data[heal_idx, COL_HP] - hp_before_heal).clamp_min(0.0).to(torch.float32)
                 self.grid[1, pos_xy[on_heal, 1], pos_xy[on_heal, 0]] = data[heal_idx, COL_HP].to(self._grid_dt)
+
+                heal_reward_coef = float(getattr(config, "PPO_REWARD_HEALING_RECOVERY", 0.0))
+                if heal_reward_coef != 0.0 and int(heal_idx.numel()) > 0:
+                    heal_reward = healed_delta * heal_reward_coef
+                    individual_rewards.index_add_(0, heal_idx, heal_reward.to(self._data_dt))
+                    reward_healing_recovered.index_add_(0, heal_idx, heal_reward)
 
             # Metabolism / attrition
             if meta_drain := getattr(config, "METABOLISM_ENABLED", True):
@@ -1698,7 +1790,6 @@ class TickEngine:
                         credit_kills=False,
                         death_cause="metabolism",
                     )
-                    metrics.deaths_metabolism += (rD + bD)
                     meta_rd += rD
                     meta_bd += bD
 
@@ -1727,12 +1818,21 @@ class TickEngine:
                                 winners_on_cp = on_cp & (teams_alive == 3.0)
                             if winners_on_cp is not None and winners_on_cp.any():
                                 winners_idx = alive_idx[winners_on_cp]
-                                reward_val = config.PPO_REWARD_CONTESTED_CP
+                                reward_val = float(config.PPO_REWARD_CONTESTED_CP)
+
+                                cp_add = torch.full(
+                                    (int(winners_idx.numel()),),
+                                    reward_val,
+                                    device=self.device,
+                                    dtype=torch.float32,
+                                )
+
                                 individual_rewards.index_add_(
                                     0,
                                     winners_idx,
-                                    torch.full_like(winners_idx, reward_val, dtype=self._data_dt),
+                                    cp_add.to(self._data_dt),
                                 )
+                                reward_contested_cp_individual.index_add_(0, winners_idx, cp_add)
 
         # ---------------------------------------------------------------------
         # 8) PPO REINFORCEMENT LEARNING LOGGING
@@ -1741,13 +1841,6 @@ class TickEngine:
             # IMPORTANT: these are REGISTRY SLOT IDS captured at decision time (not persistent UIDs).
             # PPO runtime is slot-based because it tracks per-slot state in the live registry.
             ppo_slot_ids = torch.cat(rec_agent_ids)
-
-            # Team-level rewards:
-            # - TEAM_KILL_REWARD for kills
-            # - PPO_REWARD_DEATH for deaths (may be negative)
-            # - capture point reward from metrics.cp_*_tick
-            team_r_rew = (combat_bd * config.TEAM_KILL_REWARD) + ((combat_rd + meta_rd) * config.PPO_REWARD_DEATH) + metrics.cp_red_tick
-            team_b_rew = (combat_rd * config.TEAM_KILL_REWARD) + ((combat_bd + meta_bd) * config.PPO_REWARD_DEATH) + metrics.cp_blue_tick
 
             # Per-agent HP reward each tick (dense shaping)
             current_hp = data[ppo_slot_ids, COL_HP]
@@ -1768,8 +1861,60 @@ class TickEngine:
                 # Legacy/default behavior (backward compatible): linear in current HP.
                 hp_reward = hp_reward_base
 
+            rec_team_ids = torch.cat(rec_teams)
+            team_is_red = (rec_team_ids == 2.0)
+
+            team_kill_reward = torch.where(
+                team_is_red,
+                torch.full((int(ppo_slot_ids.numel()),), float(combat_bd * config.TEAM_KILL_REWARD), device=self.device, dtype=torch.float32),
+                torch.full((int(ppo_slot_ids.numel()),), float(combat_rd * config.TEAM_KILL_REWARD), device=self.device, dtype=torch.float32),
+            )
+            team_death_reward = torch.where(
+                team_is_red,
+                torch.full((int(ppo_slot_ids.numel()),), float((combat_rd + meta_rd) * config.PPO_REWARD_DEATH), device=self.device, dtype=torch.float32),
+                torch.full((int(ppo_slot_ids.numel()),), float((combat_bd + meta_bd) * config.PPO_REWARD_DEATH), device=self.device, dtype=torch.float32),
+            )
+            team_cp_reward = torch.where(
+                team_is_red,
+                torch.full((int(ppo_slot_ids.numel()),), float(metrics.cp_red_tick), device=self.device, dtype=torch.float32),
+                torch.full((int(ppo_slot_ids.numel()),), float(metrics.cp_blue_tick), device=self.device, dtype=torch.float32),
+            )
+
+            individual_total_reward = (
+                reward_kill_individual[ppo_slot_ids]
+                + reward_damage_dealt_individual[ppo_slot_ids]
+                + reward_damage_taken_penalty[ppo_slot_ids]
+                + reward_contested_cp_individual[ppo_slot_ids]
+                + reward_healing_recovered[ppo_slot_ids]
+            )
+            team_total_reward = team_kill_reward + team_death_reward + team_cp_reward
+            hp_reward_f32 = hp_reward.to(torch.float32)
+
             # Final reward: individual + team + hp shaping
-            final_rewards = individual_rewards[ppo_slot_ids] + torch.where(torch.cat(rec_teams) == 2.0, team_r_rew, team_b_rew) + hp_reward
+            final_rewards = (individual_total_reward + team_total_reward + hp_reward_f32).to(self._data_dt)
+
+            if telemetry is not None and getattr(telemetry, "enabled", False):
+                try:
+                    self._telemetry_set_phase(telemetry, tick=int(self.stats.tick), phase="ppo_reward_components")
+                    telemetry.record_ppo_reward_components_by_slot(
+                        tick=int(self.stats.tick),
+                        slot_ids=ppo_slot_ids,
+                        reward_total=final_rewards.to(torch.float32),
+                        reward_hp=hp_reward_f32,
+                        reward_kill_individual=reward_kill_individual[ppo_slot_ids],
+                        reward_damage_dealt_individual=reward_damage_dealt_individual[ppo_slot_ids],
+                        reward_damage_taken_penalty=reward_damage_taken_penalty[ppo_slot_ids],
+                        reward_contested_cp_individual=reward_contested_cp_individual[ppo_slot_ids],
+                        reward_team_kill=team_kill_reward,
+                        reward_team_death=team_death_reward,
+                        reward_team_cp=team_cp_reward,
+                        reward_healing_recovered=reward_healing_recovered[ppo_slot_ids],
+                    )
+                except Exception as e:
+                    try:
+                        telemetry._anomaly(f"tick.ppo_reward_components hook failed: {e}")
+                    except Exception:
+                        pass
 
             # Bootstrapping values for next state if training next step
             #

@@ -929,6 +929,33 @@ class CheckpointManager:
         """
         # --- Restore world/registry ---
         reg = ckpt["registry"]
+        from engine.agent_registry import NUM_COLS
+
+        ckpt_agent_data = reg["agent_data"]
+        if int(ckpt_agent_data.dim()) != 2:
+            raise CheckpointError(
+                f"checkpoint registry.agent_data must be rank-2, got shape={tuple(ckpt_agent_data.shape)}"
+            )
+        if int(ckpt_agent_data.shape[0]) != int(registry.capacity):
+            raise CheckpointError(
+                f"checkpoint capacity mismatch: ckpt_slots={int(ckpt_agent_data.shape[0])} registry.capacity={int(registry.capacity)}"
+            )
+        if int(ckpt_agent_data.shape[1]) != int(NUM_COLS):
+            raise CheckpointError(
+                f"checkpoint NUM_COLS mismatch: ckpt_cols={int(ckpt_agent_data.shape[1])} expected={int(NUM_COLS)}"
+            )
+        if len(reg["brains"]) != int(registry.capacity):
+            raise CheckpointError(
+                f"checkpoint brains length mismatch: got={len(reg['brains'])} expected={int(registry.capacity)}"
+            )
+        if len(reg["generations"]) != int(registry.capacity):
+            raise CheckpointError(
+                f"checkpoint generations length mismatch: got={len(reg['generations'])} expected={int(registry.capacity)}"
+            )
+        if reg.get("agent_uids") is not None and int(reg["agent_uids"].numel()) != int(registry.capacity):
+            raise CheckpointError(
+                f"checkpoint agent_uids length mismatch: got={int(reg['agent_uids'].numel())} expected={int(registry.capacity)}"
+            )
 
         # Restore agent data (move to specified device)
         registry.agent_data = reg["agent_data"].to(device)
@@ -947,7 +974,10 @@ class CheckpointManager:
                 pass
 
         # Restore generations
-        registry.generations = list(reg["generations"])
+        generations = [int(g) for g in list(reg["generations"])]
+        if any(int(g) < 0 for g in generations):
+            raise CheckpointError("checkpoint contains negative generation values")
+        registry.generations = generations
 
         # Restore next agent ID
         registry._next_agent_id = int(reg["next_agent_id"])
@@ -964,7 +994,14 @@ class CheckpointManager:
             b = _make_brain(payload["kind"], device)
             b.load_state_dict(payload["state_dict"])
             registry.brains[i] = b
-
+        if hasattr(registry, "agent_uids"):
+            valid_uid_mask = (registry.agent_uids >= 0)
+            if bool(valid_uid_mask.any().item()):
+                max_uid = int(registry.agent_uids[valid_uid_mask].max().item())
+                if int(registry._next_agent_id) <= max_uid:
+                    raise CheckpointError(
+                        f"checkpoint next_agent_id is stale: next_agent_id={int(registry._next_agent_id)} max_uid={max_uid}"
+                    )
         # --- Restore engine internal state ---
         eng = ckpt.get("engine", {})
 
@@ -1046,6 +1083,7 @@ class CheckpointManager:
             "_last_period_tick",
             "_rare_mutation_pending_ticket",
             "_rare_mutation_last_window_idx",
+            "_legacy_respawn_counter",
         ]
         out: Dict[str, Any] = {}
 
@@ -1091,7 +1129,7 @@ class CheckpointManager:
         # Telemetry safety: best-effort flush BEFORE freezing the checkpoint.
         # This does not affect determinism; it just improves durability of logs.
         telemetry = getattr(engine, "telemetry", None)
-        if telemetry is not None:
+        if telemetry is not None and hasattr(telemetry, "flush"):
             try:
                 telemetry.flush(reason="checkpoint_save")
             except Exception:
