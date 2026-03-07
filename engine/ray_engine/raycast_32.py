@@ -14,14 +14,13 @@ from __future__ import annotations
 #
 # Note: This does not change program behavior for the core tensor computations
 # below; it affects only annotation evaluation semantics.
-from __future__ import annotations
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Typing imports
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional[T] expresses that a value may be of type T or may be None.
 # Here it is used to indicate that `max_steps_each` can be omitted.
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Numerical / ML library imports
@@ -148,13 +147,134 @@ DIRS32 = _generate_32_directions()
 #
 # The number of classes is therefore 6.
 _TYPE_CLASSES = 6
+_RAY_COUNT = 32
+_RAY_FEAT_DIM = _TYPE_CLASSES + 2
+
+
+class _Raycast32Scratch:
+    """
+    Reusable bounded-shape scratch for the 32-ray first-hit path.
+
+    Design goals:
+    - cache hot device constants once per (device, output dtype)
+    - reuse large stable-shape outputs / metadata buffers across calls
+    - reuse the major bounded-shape ray-march intermediates that were still
+      allocating per call (coordinate workspaces, integer index buffers, active)
+    - keep all externally visible semantics unchanged
+
+    Safety discipline:
+    - buffers are capacity-based and sliced to [:N] / [:, :, :S]
+    - every reused writable region that participates in the current call is
+      fully overwritten or explicitly reset before readback
+    - no unread stale region is ever exposed outside the current slice
+    """
+
+    def __init__(self, device: torch.device, feat_dtype: torch.dtype) -> None:
+        self.device = device
+        self.feat_dtype = feat_dtype
+        self.capacity_n = 0
+        self.capacity_steps = 0
+
+        # Cached device constants.
+        self.dirs: Optional[torch.Tensor] = None           # (1,32,2) float32
+        self.steps_f: Optional[torch.Tensor] = None        # (1,1,S,1) float32
+        self.step_ids: Optional[torch.Tensor] = None       # (1,1,S) long
+
+        # Reusable bounded-shape buffers.
+        self.max_steps_buf: Optional[torch.Tensor] = None  # (N,) long
+
+        # Coordinate workspaces and masks reused across calls.
+        self.coords_x_f: Optional[torch.Tensor] = None     # (N,32,S) float32
+        self.coords_y_f: Optional[torch.Tensor] = None     # (N,32,S) float32
+        self.x: Optional[torch.Tensor] = None              # (N,32,S) long
+        self.y: Optional[torch.Tensor] = None              # (N,32,S) long
+        self.active: Optional[torch.Tensor] = None         # (N,1,S) bool
+
+        # Reused per-ray result holders / final features.
+        self.first_kind: Optional[torch.Tensor] = None     # (N,32) int64
+        self.first_idx: Optional[torch.Tensor] = None      # (N,32) long
+        self.feat: Optional[torch.Tensor] = None           # (N,32,8) feat dtype
+
+    def ensure(self, min_n: int, max_steps: int, feat_dtype: torch.dtype) -> None:
+        need_n = max(1, int(min_n))
+        need_s = max(1, int(max_steps))
+        new_n = max(self.capacity_n, need_n)
+        new_s = max(self.capacity_steps, need_s)
+
+        # Directions and step tensors depend only on device and max step capacity.
+        if (
+            self.dirs is None
+            or self.steps_f is None
+            or self.step_ids is None
+            or self.capacity_steps < need_s
+        ):
+            self.dirs = DIRS32.to(device=self.device).view(1, _RAY_COUNT, 2)
+            self.steps_f = torch.arange(
+                1, new_s + 1,
+                device=self.device,
+                dtype=torch.float32,
+            ).view(1, 1, new_s, 1)
+            self.step_ids = torch.arange(
+                1, new_s + 1,
+                device=self.device,
+                dtype=torch.long,
+            ).view(1, 1, new_s)
+
+        # Capacity grows monotonically; buffers are reallocated only when N/S grow
+        # or when the final feature dtype changes.
+        if (
+            self.capacity_n < need_n
+            or self.capacity_steps < need_s
+            or self.max_steps_buf is None
+            or self.coords_x_f is None
+            or self.coords_y_f is None
+            or self.x is None
+            or self.y is None
+            or self.active is None
+            or self.first_kind is None
+            or self.first_idx is None
+            or self.feat is None
+            or self.feat_dtype != feat_dtype
+        ):
+            self.capacity_n = new_n
+            self.capacity_steps = new_s
+            self.feat_dtype = feat_dtype
+
+            self.max_steps_buf = torch.empty((new_n,), device=self.device, dtype=torch.long)
+
+            self.coords_x_f = torch.empty((new_n, _RAY_COUNT, new_s), device=self.device, dtype=torch.float32)
+            self.coords_y_f = torch.empty((new_n, _RAY_COUNT, new_s), device=self.device, dtype=torch.float32)
+            self.x = torch.empty((new_n, _RAY_COUNT, new_s), device=self.device, dtype=torch.long)
+            self.y = torch.empty((new_n, _RAY_COUNT, new_s), device=self.device, dtype=torch.long)
+            self.active = torch.empty((new_n, 1, new_s), device=self.device, dtype=torch.bool)
+
+            self.first_kind = torch.empty((new_n, _RAY_COUNT), device=self.device, dtype=torch.int64)
+            self.first_idx = torch.empty((new_n, _RAY_COUNT), device=self.device, dtype=torch.long)
+            self.feat = torch.empty((new_n, _RAY_COUNT, _RAY_FEAT_DIM), device=self.device, dtype=feat_dtype)
+        else:
+            # Step constants may have grown even if other buffers did not need a
+            # dtype-triggered reallocation.
+            self.capacity_steps = new_s
+
+
+# Scratch is cached per device and final feature dtype.
+_SCRATCH_CACHE: Dict[Tuple[torch.device, torch.dtype], _Raycast32Scratch] = {}
+
+
+def _get_scratch(device: torch.device, feat_dtype: torch.dtype) -> _Raycast32Scratch:
+    key = (device, feat_dtype)
+    scratch = _SCRATCH_CACHE.get(key)
+    if scratch is None:
+        scratch = _Raycast32Scratch(device=device, feat_dtype=feat_dtype)
+        _SCRATCH_CACHE[key] = scratch
+    return scratch
 
 
 @torch.no_grad()
 def raycast32_firsthit(
     pos_xy: torch.Tensor,               # (N,2) long
-    grid: torch.Tensor,                  # (3,H,W)
-    unit_map: torch.Tensor,              # (H,W) int32 ∈{-1, 1, 2}
+    grid: torch.Tensor,                 # (3,H,W)
+    unit_map: torch.Tensor,             # (H,W) int32 ∈{-1, 1, 2}
     max_steps_each: Optional[torch.Tensor] = None,  # (N,) long — per-agent vision
 ) -> torch.Tensor:
     """
@@ -222,6 +342,9 @@ def raycast32_firsthit(
     #
     # N = number of agents.
     N = int(pos_xy.size(0))
+    if N == 0:
+        return torch.empty((0, _RAY_COUNT * _RAY_FEAT_DIM), device=device, dtype=dtype)
+
     #
     # H, W from grid shape (3, H, W).
     H, W = int(grid.size(1)), int(grid.size(2))
@@ -235,66 +358,75 @@ def raycast32_firsthit(
     #   • higher compute and memory
     R_global = int(getattr(config, "RAYCAST_MAX_STEPS", 10))
 
+    # Prepare reusable scratch for the current device / dtype / capacity.
+    scratch = _get_scratch(device, dtype)
+    scratch.ensure(N, R_global, dtype)
+
     # Per-agent maximum range:
     # If not provided, every agent uses the global cap.
     # If provided, it is clamped into [0, R_global] for safety.
+    max_steps_buf = scratch.max_steps_buf[:N]
     if max_steps_each is None:
-        max_steps_each = torch.full((N,), R_global, device=device, dtype=torch.long)
+        max_steps_buf.fill_(R_global)
     else:
-        max_steps_each = torch.clamp(
-            max_steps_each.to(device=device, dtype=torch.long), 0, R_global
-        )
+        max_steps_buf.copy_(max_steps_each.to(device=device, dtype=torch.long))
+        max_steps_buf.clamp_(0, R_global)
+    max_steps_each = max_steps_buf
 
     # -------------------------------------------------------------------------
     # Construct ray-marching coordinates for all agents, all rays, all steps
     # -------------------------------------------------------------------------
-    # dirs: (1, 32, 2) direction vectors, broadcastable across agents and steps.
-    dirs = DIRS32.to(device).view(1, 32, 2)                     # (1,32,2)
+    # dirs: (1, 32, 2) direction vectors, cached once on the correct device.
+    dirs = scratch.dirs                                                # (1,32,2)
+    dirs_x = dirs[..., 0].view(1, _RAY_COUNT, 1)                       # (1,32,1)
+    dirs_y = dirs[..., 1].view(1, _RAY_COUNT, 1)                       # (1,32,1)
 
-    # base: (N, 1, 1, 2) base positions, converted to float for multiplication.
-    # Although positions are integer grid coordinates, float is used for the
-    # directional step addition. Discretization occurs after computing coords.
-    base = pos_xy.view(N, 1, 1, 2).float()                      # (N,1,1,2)
+    # Base x/y positions are views over the agent positions, converted to float
+    # because ray marching is performed in continuous direction space before
+    # integer truncation.
+    base_x = pos_xy[:, 0].view(N, 1, 1).to(torch.float32)              # (N,1,1)
+    base_y = pos_xy[:, 1].view(N, 1, 1).to(torch.float32)              # (N,1,1)
 
-    # steps: (1, 1, S, 1) where S = R_global.
-    # This constructs step distances 1..R_global inclusive.
+    # steps: (1, 1, S)
     # Step distance begins at 1 because step=0 would correspond to the origin cell.
-    steps = torch.arange(
-        1, R_global + 1,
-        device=device,
-        dtype=torch.float32
-    ).view(1, 1, R_global, 1)  # (1,1,S,1)
+    steps = scratch.steps_f[:, :, :R_global, 0]                        # (1,1,S)
 
-    # coords: (N, 32, S, 2)
-    # For each agent, each ray direction, and each step distance, compute:
-    #   coord = base + dir * step
-    #
-    # Then cast to long so the coordinate becomes integer indices for grid lookup.
-    # This is a simplified rasterization of a ray in a discrete lattice.
-    coords = (base + dirs.view(1, 32, 1, 2) * steps).long()     # (N,32,S,2)
+    # Reuse float coordinate workspaces, then truncate toward zero to preserve
+    # the exact old `.to(torch.long)` semantics before clamping.
+    coords_x_f = scratch.coords_x_f[:N, :, :R_global]                  # (N,32,S)
+    coords_y_f = scratch.coords_y_f[:N, :, :R_global]                  # (N,32,S)
+
+    coords_x_f.copy_(dirs_x.expand_as(coords_x_f))
+    coords_x_f.mul_(steps.expand_as(coords_x_f))
+    coords_x_f.add_(base_x.expand_as(coords_x_f))
+    torch.trunc(coords_x_f, out=coords_x_f)
+
+    coords_y_f.copy_(dirs_y.expand_as(coords_y_f))
+    coords_y_f.mul_(steps.expand_as(coords_y_f))
+    coords_y_f.add_(base_y.expand_as(coords_y_f))
+    torch.trunc(coords_y_f, out=coords_y_f)
 
     # Split coords into x and y components and clamp to grid bounds:
     # x ∈ [0, W-1], y ∈ [0, H-1].
-    #
-    # clamp_ is in-place to reduce temporary allocations.
-    x = coords[..., 0].clamp_(0, W - 1)                          # (N,32,S)
-    y = coords[..., 1].clamp_(0, H - 1)                          # (N,32,S)
+    x = scratch.x[:N, :, :R_global]                                    # (N,32,S)
+    y = scratch.y[:N, :, :R_global]                                    # (N,32,S)
+    x.copy_(coords_x_f)
+    y.copy_(coords_y_f)
+    x.clamp_(0, W - 1)
+    y.clamp_(0, H - 1)
 
     # -------------------------------------------------------------------------
     # Construct the "active" mask for per-agent max steps
     # -------------------------------------------------------------------------
     # step_ids: (1, 1, S) contains step indices 1..S (as long).
     # We use these to mask out steps beyond each agent's max range.
-    step_ids = torch.arange(
-        1, R_global + 1,
-        device=device,
-        dtype=torch.long
-    ).view(1, 1, R_global)
+    step_ids = scratch.step_ids[:, :, :R_global]
 
     # active: (N, 1, S)
     # active[i, :, s] is True iff step_ids[s] <= max_steps_each[i].
     # This ensures that agents with shorter vision do not "see" beyond their range.
-    active = step_ids <= max_steps_each.view(N, 1, 1)            # (N,1,S)
+    active = scratch.active[:N, :, :R_global]
+    torch.le(step_ids, max_steps_each.view(N, 1, 1), out=active)
 
     # -------------------------------------------------------------------------
     # Gather occupancy and hp values along the ray paths
@@ -305,8 +437,9 @@ def raycast32_firsthit(
     # The indexing grid[0][y, x] leverages advanced indexing:
     #   • y and x are broadcasted index tensors
     #   • the result is a gathered tensor of matching shape.
-    occ = grid[0][y, x]                                          # (N,32,S)
-    hp = grid[1][y, x]                                           # (N,32,S)
+    occ = grid[0][y, x]                                                # (N,32,S)
+    hp = grid[1][y, x]                                                 # (N,32,S)
+    agent_id = grid[2][y, x]                                           # (N,32,S)
 
     # -------------------------------------------------------------------------
     # Identify hits: walls and agents
@@ -320,33 +453,24 @@ def raycast32_firsthit(
     # Note: has_agent is computed from grid[2] (agent_id), not from occ.
     # This is important: an "agent tile" might be represented in occ but
     # agent_id channel is the authoritative presence check here.
-    has_agent = (grid[2][y, x] >= 0) & active
+    has_agent = (agent_id >= 0) & active
 
     # -------------------------------------------------------------------------
     # Determine the index (step position) of the first wall hit per ray
     # -------------------------------------------------------------------------
-    # We want, for each (agent, ray), the earliest step where a wall appears.
-    #
-    # Strategy:
-    #   1) is_wall.any(dim=-1) tells whether there exists any wall hit along steps.
-    #   2) argmax over a float-cast boolean mask returns the first index where
-    #      the mask is 1 (True), because booleans become {0.0, 1.0}.
-    #
-    # If there is no wall hit, idx_wall is set to -1.
     idx_wall = torch.where(
         is_wall.any(dim=-1),
         is_wall.to(torch.float32).argmax(dim=-1),
-        -1
+        -1,
     )
 
     # -------------------------------------------------------------------------
     # Determine the index (step position) of the first agent hit per ray
     # -------------------------------------------------------------------------
-    # Same method as idx_wall but for agent hits.
     idx_agent = torch.where(
         has_agent.any(dim=-1),
         has_agent.to(torch.float32).argmax(dim=-1),
-        -1
+        -1,
     )
 
     # -------------------------------------------------------------------------
@@ -354,20 +478,15 @@ def raycast32_firsthit(
     #   first_kind: which class the first hit belongs to (type code)
     #   first_idx:  step index (0-based along the steps dimension) of first hit
     # -------------------------------------------------------------------------
-    # first_kind:
-    #   Initialized to 0 (meaning "none"). This aligns with class encoding.
-    # first_idx:
-    #   Initialized to -1 meaning "no valid hit".
-    first_kind = torch.full((N, 32), 0, dtype=torch.int64, device=device)
-    first_idx = torch.full((N, 32), -1, dtype=torch.long, device=device)
+    # Reused buffers are explicitly reset over the active slice before use.
+    first_kind = scratch.first_kind[:N]
+    first_idx = scratch.first_idx[:N]
+    first_kind.zero_()
+    first_idx.fill_(-1)
 
     # -------------------------------------------------------------------------
     # Determine which kind of hit occurs first (wall vs agent)
     # -------------------------------------------------------------------------
-    # There are three mutually exclusive cases:
-    #   • both_hit: ray hits at least one wall AND at least one agent
-    #   • only_wall: wall exists, agent does not
-    #   • only_agent: agent exists, wall does not
     both_hit = (idx_wall >= 0) & (idx_agent >= 0)
     only_wall = (idx_wall >= 0) & ~both_hit
     only_agent = (idx_agent >= 0) & ~both_hit
@@ -384,10 +503,6 @@ def raycast32_firsthit(
         first_kind[both_hit & earlier_is_wall] = 1
 
         # Temporarily encode "agent hit" as -2 for later refinement.
-        # Why temporary?
-        #   Because determining which *agent class* was hit requires looking up
-        #   both the team marker (from grid[0]) and unit subtype (unit_map),
-        #   which happens below using the gathered hit location.
         first_kind[both_hit & ~earlier_is_wall] = -2  # temp code for agent
 
     # If only a wall hit exists, it's trivially the first hit.
@@ -408,44 +523,14 @@ def raycast32_firsthit(
     # Only do the extra gather work if there is at least one ray whose first hit
     # is an agent.
     if agent_mask.any():
-        # gather_idx: shape (N, 32, 1)
-        # We need to gather the corresponding (x, y) coordinates at the first hit.
-        #
-        # first_idx is 0-based along the S dimension; gather expects indices
-        # within valid range. clamp_min(0) prevents invalid negative indices
-        # from crashing gather; these will be masked out later anyway.
         gather_idx = first_idx.clamp_min(0).unsqueeze(-1)
-
-        # Gather y and x at the first-hit step for each (agent, ray).
-        #
-        # y, x have shape (N, 32, S). We gather along dim=2 (the step dimension).
         gather_y = torch.gather(y, 2, gather_idx).squeeze(-1)
         gather_x = torch.gather(x, 2, gather_idx).squeeze(-1)
 
-        # t: occupancy marker at the hit cell (from channel 0).
-        # u: unit subtype at the hit cell (from unit_map).
-        #
-        # They are cast to int32 explicitly, presumably to ensure consistent
-        # comparison behavior and avoid dtype mismatches.
         t = grid[0][gather_y, gather_x].to(torch.int32)
         u = unit_map[gather_y, gather_x].to(torch.int32)
 
-        # code: placeholder tensor for resolved class codes (int64).
         code = torch.zeros_like(t, dtype=torch.int64)
-
-        # Class resolution logic:
-        #
-        # t == 2 means "red team occupancy marker"
-        # t == 3 means "blue team occupancy marker"
-        #
-        # u == 1 means subtype-1 (documented as soldier in comment)
-        # u == 2 means subtype-2 (documented as archer in comment)
-        #
-        # Thus:
-        #   (t==2, u==1) => class 2: red-soldier
-        #   (t==2, u==2) => class 3: red-archer
-        #   (t==3, u==1) => class 4: blue-soldier
-        #   (t==3, u==2) => class 5: blue-archer
         code[(t == 2) & (u == 1)] = 2
         code[(t == 2) & (u == 2)] = 3
         code[(t == 3) & (u == 1)] = 4
@@ -457,93 +542,41 @@ def raycast32_firsthit(
     # -------------------------------------------------------------------------
     # Compute normalized distance feature
     # -------------------------------------------------------------------------
-    # den: per-agent normalization denominator = max_steps_each, clamped to >= 1.
-    #
-    # Why clamp_min(1)?
-    #   If an agent has max_steps_each = 0, dividing by 0 would be invalid.
-    #   In that case, active mask would be all False (no steps allowed), and
-    #   valid hits should be 0 anyway. Using den>=1 avoids NaNs/infs.
     den = max_steps_each.clamp_min(1).to(torch.float32).view(N, 1)
-
-    # dist_idx: the distance "in steps" to the hit, 1-based rather than 0-based.
-    #
-    # first_idx is 0-based index into the step dimension:
-    #   first_idx = 0 means hit at step 1
-    #   first_idx = 1 means hit at step 2
-    # so we add 1.0 to convert to human-meaningful step count.
     dist_idx = first_idx.to(torch.float32) + 1.0
-
-    # valid: mask (as float 0.0/1.0) indicating whether a hit exists (first_idx>=0).
     valid = (first_idx >= 0).to(torch.float32)
-
-    # dist_norm:
-    #   dist_norm = (dist_idx / den) if valid else 0
-    #
-    # This yields a value in approximately [0, 1], where:
-    #   • 1/den corresponds to a hit at the first step,
-    #   • 1 corresponds to a hit at exactly max_steps_each,
-    #   • 0 corresponds to no hit.
     dist_norm = (dist_idx / den) * valid
 
     # -------------------------------------------------------------------------
     # Compute normalized HP feature at the first-hit location
     # -------------------------------------------------------------------------
-    # hp_first: gather HP at first-hit step index.
-    #
-    # Note:
-    #   We gather even when first_idx is -1, but clamp_min(0) ensures index is
-    #   valid. Multiplying by valid then zeros out those entries.
     hp_first = torch.gather(
         hp,
         2,
-        first_idx.clamp_min(0).unsqueeze(-1)
+        first_idx.clamp_min(0).unsqueeze(-1),
     ).squeeze(-1) * valid
 
     # -------------------------------------------------------------------------
-    # One-hot encode the first-hit class
-    # -------------------------------------------------------------------------
-    # onehot: shape (N, 32, 6)
-    # Initialized to zeros.
-    onehot = torch.zeros((N, 32, _TYPE_CLASSES), dtype=dtype, device=device)
-
-    # idx_valid: ensure class indices fall into [0, 5].
-    #
-    # This is defensive: if first_kind had unexpected negative values, or values
-    # outside the class range, scatter_ would error. Here:
-    #   • negative values become 0
-    #   • too-large values become 5
-    #
-    # In normal operation, first_kind should already be in {0..5}.
-    idx_valid = first_kind.clamp(min=0, max=_TYPE_CLASSES - 1)
-
-    # scatter_ places a 1.0 into the appropriate class slot for each (N, 32).
-    #   dimension 2 is the class dimension.
-    onehot.scatter_(2, idx_valid.unsqueeze(-1), 1.0)
-
-    # -------------------------------------------------------------------------
-    # Normalize HP by MAX_HP
-    # -------------------------------------------------------------------------
-    # max_hp is read from config. The expression "or 1.0" ensures it is never 0.
-    # This avoids division-by-zero if MAX_HP is missing or accidentally set to 0.
-    max_hp = float(getattr(config, "MAX_HP", 1.0)) or 1.0
-
-    # hp_norm:
-    #   normalized hp in [0, 1] (clamped) and cast to the desired dtype.
-    hp_norm = (hp_first / max_hp).clamp(0.0, 1.0).to(dtype)
-
-    # Ensure dist_norm uses the same dtype for consistent feature tensor.
-    dist_norm = dist_norm.to(dtype)
-
-    # -------------------------------------------------------------------------
-    # Concatenate per-ray feature components into final per-agent vector
+    # Assemble per-ray feature tensor in reusable output scratch
     # -------------------------------------------------------------------------
     # feat: shape (N, 32, 8)
     # ordering is exactly:
     #   [onehot6, dist_norm, hp_norm]
-    feat = torch.cat(
-        [onehot, dist_norm.unsqueeze(-1), hp_norm.unsqueeze(-1)],
-        dim=-1
-    )
+    feat = scratch.feat[:N]
+    onehot = feat[..., :_TYPE_CLASSES]
+    onehot.zero_()
+
+    # idx_valid: ensure class indices fall into [0, 5].
+    idx_valid = first_kind.clamp(min=0, max=_TYPE_CLASSES - 1)
+
+    # scatter_ places a 1.0 into the appropriate class slot for each (N, 32).
+    # dimension 2 is the class dimension.
+    onehot.scatter_(2, idx_valid.unsqueeze(-1), 1.0)
+
+    # Normalize HP by MAX_HP.
+    max_hp = float(getattr(config, "MAX_HP", 1.0)) or 1.0
+    feat[..., _TYPE_CLASSES].copy_(dist_norm.to(dtype))
+    feat[..., _TYPE_CLASSES + 1].copy_((hp_first / max_hp).clamp(0.0, 1.0).to(dtype))
 
     # reshape to (N, 256) = (N, 32*8) for downstream consumption (e.g., MLP).
-    return feat.reshape(N, 32 * 8)
+    return feat.reshape(N, _RAY_COUNT * _RAY_FEAT_DIM)
