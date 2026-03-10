@@ -24,6 +24,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+import config
+
 
 GridShape = Tuple[int, int]
 
@@ -374,3 +376,202 @@ class CatastropheController:
         if not isinstance(active_payload, dict):
             raise ValueError("active catastrophe checkpoint payload is missing active_state")
         self._active = ActiveCatastropheState.from_checkpoint_payload(active_payload, device=self.device)
+
+# -----------------------------------------------------------------------------
+# First catastrophe pack (Patch 5)
+# -----------------------------------------------------------------------------
+_MANUAL_CATASTROPHE_EPS = 1e-6
+_MANUAL_REGIONAL_ATTENUATION_FACTOR_DEFAULT = 0.25
+
+
+def _resolve_duration_ticks(duration_ticks: Optional[int]) -> int:
+    """Resolve a manual catastrophe duration using existing config defaults."""
+    if duration_ticks is None:
+        duration_ticks = int(getattr(config, "CATASTROPHE_DEFAULT_DURATION_TICKS", 0))
+    duration_ticks = int(duration_ticks)
+    if duration_ticks <= 0:
+        raise ValueError(
+            "manual catastrophe duration must be > 0; set duration_ticks explicitly or configure "
+            "CATASTROPHE_DEFAULT_DURATION_TICKS"
+        )
+    return duration_ticks
+
+
+def _canonical_base_zone_value_map(base_zone_value_map: torch.Tensor) -> torch.Tensor:
+    """Normalize the canonical signed base-zone field used to derive manual catastrophes."""
+    return _normalize_float_grid(base_zone_value_map, name="base_zone_value_map")
+
+
+def _active_nonzero_base_mask(base_zone_value_map: torch.Tensor, *, eps: float = _MANUAL_CATASTROPHE_EPS) -> torch.Tensor:
+    """Return a mask of cells whose canonical base-zone value is meaningfully non-zero."""
+    base = _canonical_base_zone_value_map(base_zone_value_map)
+    return base.abs() > float(eps)
+
+
+def _full_world_edit_lock_mask(base_zone_value_map: torch.Tensor) -> torch.Tensor:
+    """Lock the whole canonical base layer while a manual catastrophe is active.
+
+    Design intent:
+    - the operator sees a runtime-effective zone field during a catastrophe
+    - manual editing should never mutate the hidden canonical layer underneath that
+    - therefore Patch 5 uses a world-wide edit lock for all manual catastrophe presets
+    """
+    base = _canonical_base_zone_value_map(base_zone_value_map)
+    return torch.ones_like(base, dtype=torch.bool)
+
+
+def _regional_half_mask(*, shape: GridShape, device: torch.device, region: str) -> torch.Tensor:
+    """Return a deterministic half-world boolean mask for one supported region label."""
+    h, w = _normalize_grid_shape(shape)
+    region_key = str(region).strip().lower()
+    mask = torch.zeros((h, w), device=device, dtype=torch.bool)
+
+    if region_key == "left":
+        mask[:, : max(1, w // 2)] = True
+        return mask
+    if region_key == "right":
+        mask[:, w // 2 :] = True
+        return mask
+    if region_key == "top":
+        mask[: max(1, h // 2), :] = True
+        return mask
+    if region_key == "bottom":
+        mask[h // 2 :, :] = True
+        return mask
+
+    raise ValueError(f"unsupported regional catastrophe region: {region!r}")
+
+
+def build_inversion_catastrophe_spec(
+    *,
+    base_zone_value_map: torch.Tensor,
+    duration_ticks: Optional[int] = None,
+) -> CatastropheSpec:
+    """Flip the sign of every active non-zero canonical base-zone cell."""
+    base = _canonical_base_zone_value_map(base_zone_value_map)
+    apply_mask = _active_nonzero_base_mask(base)
+    override_value_map = (-base).clamp(-1.0, 1.0)
+    return CatastropheSpec(
+        type_name="inversion",
+        duration_ticks=_resolve_duration_ticks(duration_ticks),
+        override_value_map=override_value_map,
+        apply_mask=apply_mask,
+        edit_lock_mask=_full_world_edit_lock_mask(base),
+        metadata={
+            "preset_key": "inversion",
+            "display_name": "Inversion",
+            "scope": "global_nonzero_base",
+        },
+    )
+
+
+def build_dormancy_catastrophe_spec(
+    *,
+    base_zone_value_map: torch.Tensor,
+    duration_ticks: Optional[int] = None,
+) -> CatastropheSpec:
+    """Collapse every active non-zero canonical base-zone cell to neutral/dormant."""
+    base = _canonical_base_zone_value_map(base_zone_value_map)
+    apply_mask = _active_nonzero_base_mask(base)
+    override_value_map = torch.zeros_like(base, dtype=torch.float32)
+    return CatastropheSpec(
+        type_name="dormancy",
+        duration_ticks=_resolve_duration_ticks(duration_ticks),
+        override_value_map=override_value_map,
+        apply_mask=apply_mask,
+        edit_lock_mask=_full_world_edit_lock_mask(base),
+        metadata={
+            "preset_key": "dormancy",
+            "display_name": "Dormancy",
+            "scope": "global_nonzero_base",
+        },
+    )
+
+
+def build_regional_attenuation_catastrophe_spec(
+    *,
+    base_zone_value_map: torch.Tensor,
+    region: str,
+    factor: Optional[float] = None,
+    duration_ticks: Optional[int] = None,
+) -> CatastropheSpec:
+    """Reduce signed zone intensity in one deterministic half-world region."""
+    base = _canonical_base_zone_value_map(base_zone_value_map)
+    region_key = str(region).strip().lower()
+    if factor is None:
+        factor = float(_MANUAL_REGIONAL_ATTENUATION_FACTOR_DEFAULT)
+    if not isinstance(factor, (int, float)) or not float("-inf") < float(factor) < float("inf"):
+        raise ValueError(f"regional attenuation factor must be finite, got {factor!r}")
+    factor_f = float(factor)
+    if factor_f < 0.0 or factor_f > 1.0:
+        raise ValueError(f"regional attenuation factor must be in [0, 1], got {factor_f}")
+
+    region_mask = _regional_half_mask(shape=tuple(int(v) for v in base.shape), device=base.device, region=region_key)
+    apply_mask = region_mask & _active_nonzero_base_mask(base)
+
+    override_value_map = base.clone()
+    if bool(region_mask.any().item()):
+        override_value_map[region_mask] = (override_value_map[region_mask] * factor_f).clamp(-1.0, 1.0)
+
+    region_display = {
+        "left": "Left Half",
+        "right": "Right Half",
+        "top": "Top Half",
+        "bottom": "Bottom Half",
+    }.get(region_key, region_key.title())
+
+    return CatastropheSpec(
+        type_name="regional_attenuation",
+        duration_ticks=_resolve_duration_ticks(duration_ticks),
+        override_value_map=override_value_map,
+        apply_mask=apply_mask,
+        edit_lock_mask=_full_world_edit_lock_mask(base),
+        metadata={
+            "preset_key": f"regional_attenuation_{region_key}",
+            "display_name": f"Regional Attenuation · {region_display}",
+            "scope": "regional_half",
+            "region": region_key,
+            "attenuation_factor": factor_f,
+        },
+    )
+
+
+def build_manual_catastrophe_spec(
+    preset_key: str,
+    *,
+    base_zone_value_map: torch.Tensor,
+    duration_ticks: Optional[int] = None,
+) -> CatastropheSpec:
+    """Dispatch one Patch-5 manual catastrophe preset by stable key.
+
+    Supported preset keys:
+    - ``inversion``
+    - ``dormancy``
+    - ``regional_attenuation_left``
+    - ``regional_attenuation_right``
+    """
+    key = str(preset_key).strip().lower()
+    if key == "inversion":
+        return build_inversion_catastrophe_spec(
+            base_zone_value_map=base_zone_value_map,
+            duration_ticks=duration_ticks,
+        )
+    if key == "dormancy":
+        return build_dormancy_catastrophe_spec(
+            base_zone_value_map=base_zone_value_map,
+            duration_ticks=duration_ticks,
+        )
+    if key == "regional_attenuation_left":
+        return build_regional_attenuation_catastrophe_spec(
+            base_zone_value_map=base_zone_value_map,
+            region="left",
+            duration_ticks=duration_ticks,
+        )
+    if key == "regional_attenuation_right":
+        return build_regional_attenuation_catastrophe_spec(
+            base_zone_value_map=base_zone_value_map,
+            region="right",
+            duration_ticks=duration_ticks,
+        )
+    raise KeyError(f"unknown manual catastrophe preset: {preset_key!r}")
+

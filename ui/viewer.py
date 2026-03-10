@@ -86,6 +86,7 @@ from engine.agent_registry import (
     COL_ALIVE, COL_TEAM, COL_HP, COL_X, COL_Y, COL_UNIT,
     COL_HP_MAX, COL_VISION, COL_ATK, COL_AGENT_ID
 )
+from engine.catastrophe import build_manual_catastrophe_spec
 
 # ==============================================================================
 # Constants & colour palette
@@ -247,10 +248,12 @@ def _zone_overlay_rgb_alpha(value: float, *, dormant_alpha: float = 0.05) -> tup
     """
     Convert one signed base-zone value into a tint colour and normalized alpha.
 
-    Rendering policy for Patch 3:
+    Rendering policy for Patch 3 / Patch 5:
     - positive values: green tint, stronger with magnitude
     - negative values: purple tint, stronger with magnitude
     - zero / near-zero: faint neutral tint so dormant cells remain visually distinct
+    - when a catastrophe is active, the renderer may feed this helper the runtime-effective
+      field rather than the canonical base field so the operator sees the active override honestly
     """
     v = float(value)
     mag = max(0.0, min(1.0, abs(v)))
@@ -259,6 +262,35 @@ def _zone_overlay_rgb_alpha(value: float, *, dormant_alpha: float = 0.05) -> tup
     if v < -1e-6:
         return COLORS["zone_negative"], 0.10 + 0.28 * mag
     return COLORS["zone_dormant"], dormant_alpha
+
+
+def _catastrophe_display_name(status: Optional[Dict[str, Any]]) -> str:
+    """Return the operator-facing display name for one catastrophe status payload."""
+    if not status:
+        return "None"
+    metadata = dict(status.get("metadata", {}) or {})
+    display_name = metadata.get("display_name", None)
+    if display_name:
+        return str(display_name)
+    type_name = status.get("type_name", None)
+    if not type_name:
+        return "None"
+    return str(type_name).replace("_", " ").title()
+
+
+def _catastrophe_status_signature(status: Optional[Dict[str, Any]]) -> tuple:
+    """Return a stable cache signature for catastrophe-driven zone visuals."""
+    status = dict(status or {})
+    metadata = dict(status.get("metadata", {}) or {})
+    md_key = tuple(sorted((str(k), repr(v)) for k, v in metadata.items()))
+    return (
+        bool(status.get("active", False)),
+        str(status.get("type_name", "")),
+        int(status.get("start_tick") or -1),
+        int(status.get("active_cell_count") or 0),
+        int(status.get("locked_cell_count") or 0),
+        md_key,
+    )
 
 
 # ==============================================================================
@@ -467,7 +499,9 @@ class WorldRenderer:
         # Precomputed zone info extracted from engine.zones
         self._zone_cache = {
             "base_np": None,
+            "render_np": None,
             "edit_locked_np": None,
+            "draw_edit_locked_overlay": True,
             "cp_rects": [],
         }
 
@@ -485,7 +519,9 @@ class WorldRenderer:
 
         H, W = int(self.grid.shape[1]), int(self.grid.shape[2])
         base_np = np.zeros((H, W), dtype=np.float32)
+        render_np = base_np
         edit_locked_np = np.zeros((H, W), dtype=np.bool_)
+        draw_edit_locked_overlay = True
         cp_rects: List[tuple[int, int, int, int]] = []
 
         zones = getattr(engine, "zones", None)
@@ -496,8 +532,16 @@ class WorldRenderer:
                     base_map = getattr(zones, "heal_mask").to(dtype=torch.float32)
                 if base_map is not None:
                     base_np = base_map.detach().to(dtype=torch.float32).cpu().numpy()
+                    render_np = base_np
             except Exception:
                 pass
+
+            try:
+                effective_map = getattr(engine, "_z_effective_values", None)
+                if effective_map is not None:
+                    render_np = effective_map.detach().to(dtype=torch.float32).cpu().numpy()
+            except Exception:
+                render_np = base_np
 
             try:
                 if hasattr(zones, "base_zone_edit_locked_mask"):
@@ -508,8 +552,13 @@ class WorldRenderer:
                         .cpu()
                         .numpy()
                     )
+                    if bool(edit_locked_np.size > 0 and np.all(edit_locked_np)):
+                        # Whole-world catastrophe lockout is already called out in the HUD / inspector.
+                        # Drawing a border on every cell is visually noisy, so suppress that specific case.
+                        draw_edit_locked_overlay = False
             except Exception:
                 edit_locked_np = np.zeros((H, W), dtype=np.bool_)
+                draw_edit_locked_overlay = True
 
             # Control points: each cp_mask -> bounding rectangle (x0,y0,x1,y1)
             for m in getattr(zones, "cp_masks", []):
@@ -521,7 +570,9 @@ class WorldRenderer:
 
         self._zone_cache = {
             "base_np": base_np,
+            "render_np": render_np,
             "edit_locked_np": edit_locked_np,
+            "draw_edit_locked_overlay": draw_edit_locked_overlay,
             "cp_rects": cp_rects,
         }
 
@@ -530,7 +581,9 @@ class WorldRenderer:
         Render walls, empty cells, and signed base-zone tint onto a static surface.
 
         Important details:
-        - signed zone truth comes from the canonical base-zone value map
+        - signed zone truth normally comes from the canonical base-zone value map
+        - when a catastrophe is active, the overlay uses the runtime-effective zone field
+          so the operator sees the actual in-force override rather than the hidden base layer
         - dormant cells receive a faint neutral tint so zero is still visible
         - capture points are NOT baked into this surface; they remain a separate overlay
         """
@@ -540,8 +593,9 @@ class WorldRenderer:
 
         H, W = self.grid.shape[1], self.grid.shape[2]
         occ_np = self.grid[0].detach().cpu().numpy()
-        base_np = self._zone_cache.get("base_np", None)
+        render_np = self._zone_cache.get("render_np", None)
         edit_locked_np = self._zone_cache.get("edit_locked_np", None)
+        draw_edit_locked_overlay = bool(self._zone_cache.get("draw_edit_locked_overlay", True))
         show_zone_overlay = bool(getattr(self.viewer, "show_zone_overlay", True))
 
         for y in range(H):
@@ -550,8 +604,8 @@ class WorldRenderer:
                 terrain_color = COLORS["wall"] if occ == 1 else COLORS["empty"]
                 color = terrain_color
 
-                if show_zone_overlay and base_np is not None and occ != 1:
-                    tint_rgb, tint_alpha = _zone_overlay_rgb_alpha(float(base_np[y, x]))
+                if show_zone_overlay and render_np is not None and occ != 1:
+                    tint_rgb, tint_alpha = _zone_overlay_rgb_alpha(float(render_np[y, x]))
                     color = _blend_rgb(terrain_color, tint_rgb, tint_alpha)
 
                 cx, cy = self.cam.world_to_screen(x, y)
@@ -563,6 +617,7 @@ class WorldRenderer:
 
                 if (
                     show_zone_overlay
+                    and draw_edit_locked_overlay
                     and edit_locked_np is not None
                     and occ != 1
                     and bool(edit_locked_np[y, x])
@@ -890,6 +945,7 @@ class HudPanel:
         )
 
         self._draw_team_stats(surf, y, x, state_data)
+        self._draw_catastrophe_status(surf, y, x)
         self._draw_score_graph(surf, hud)
 
         # Minimap is a separate component
@@ -933,6 +989,21 @@ class HudPanel:
 
         surf.blit(self.viewer.text_cache.render(red_str, 16, COLORS["red"]), (x, y + 24))
         surf.blit(self.viewer.text_cache.render(blue_str, 16, COLORS["blue"]), (x, y + 48))
+
+    def _draw_catastrophe_status(self, surf, y, x):
+        """Draw a concise active-catastrophe HUD strip for operator awareness."""
+        status = self.viewer.get_catastrophe_status()
+        if not bool(status.get("active", False)):
+            line = "Catastrophe: none | Base-zone editing: unlocked"
+            color = COLORS["text_dim"]
+        else:
+            line = (
+                f"Catastrophe: {status['display_name']} | Remaining: {int(status.get('remaining_ticks', 0))}/"
+                f"{int(status.get('duration_ticks', 0))} | Cells: {int(status.get('active_cell_count', 0))} | "
+                f"Base-zone editing: locked"
+            )
+            color = COLORS["pause_text"]
+        surf.blit(self.viewer.text_cache.render(line, 13, color), (x, y + 72))
 
     def _draw_score_graph(self, surf, hud):
         """
@@ -1058,6 +1129,11 @@ class SidePanel:
             "Click World: Inspect Cell / Agent",
             "[ / ]: Decrease / Increase Base Zone",
             "0 / Backspace: Reset Base Zone",
+            "1: Trigger Inversion",
+            "2: Trigger Dormancy",
+            "3: Trigger Left Attenuation",
+            "4: Trigger Right Attenuation",
+            "C: Clear Active Catastrophe",
             "Z: Toggle Signed-Zone Overlay",
             "SPACE: Pause Simulation",
             ". : Single Step When Paused",
@@ -1161,12 +1237,25 @@ class SidePanel:
         cp_indices = info["cp_indices"]
         cp_str = ", ".join(f"CP{idx}" for idx in cp_indices) if cp_indices else "None"
         occupant_line = info.get("occupant_label") or "Occupant: None"
+        catastrophe_line = (
+            f"Catastrophe: {info['catastrophe_display_name']}"
+            if info["catastrophe_active"]
+            else "Catastrophe: None"
+        )
         lines = [
             f"Cell: ({info['cell'][0]}, {info['cell'][1]})",
             f"Terrain: {info['terrain_label']}",
             occupant_line,
             f"Base Value: {info['base_value']:+.2f}",
-            f"State: {info['state_label']}",
+            f"Base State: {info['state_label']}",
+            f"Runtime Value: {info['effective_value']:+.2f}",
+            f"Runtime State: {info['effective_state_label']}",
+            catastrophe_line,
+            (
+                f"Catastrophe Here: {'Yes' if info['catastrophe_applies_here'] else 'No'}"
+                if info['catastrophe_active']
+                else "Catastrophe Here: No"
+            ),
             f"CP Masks: {cp_str}",
             f"Edit Lock: {'Locked' if info['edit_locked'] else 'Unlocked'}",
             f"Edit Step: ±{self.viewer.base_zone_edit_step:.2f}",
@@ -1180,6 +1269,15 @@ class SidePanel:
                     color = COLORS["zone_negative"]
                 else:
                     color = COLORS["selected"]
+            elif line.startswith("Runtime Value"):
+                if info["effective_state_label"] == "Beneficial":
+                    color = COLORS["zone_positive"]
+                elif info["effective_state_label"] == "Harmful":
+                    color = COLORS["zone_negative"]
+                else:
+                    color = COLORS["selected"]
+            elif line.startswith("Catastrophe:") and info["catastrophe_active"]:
+                color = COLORS["pause_text"]
             if line.startswith("Edit Lock") and info["edit_locked"]:
                 color = COLORS["zone_locked"]
             surf.blit(self.viewer.text_cache.render(line, 13, color), (x, y))
@@ -1337,6 +1435,16 @@ class InputHandler:
                         f"Signed-zone overlay {'enabled' if self.viewer.show_zone_overlay else 'disabled'}.",
                         "text_dim",
                     )
+                elif ev.key in (pygame.K_1, pygame.K_KP1):
+                    self.viewer.trigger_manual_catastrophe("inversion")
+                elif ev.key in (pygame.K_2, pygame.K_KP2):
+                    self.viewer.trigger_manual_catastrophe("dormancy")
+                elif ev.key in (pygame.K_3, pygame.K_KP3):
+                    self.viewer.trigger_manual_catastrophe("regional_attenuation_left")
+                elif ev.key in (pygame.K_4, pygame.K_KP4):
+                    self.viewer.trigger_manual_catastrophe("regional_attenuation_right")
+                elif ev.key == pygame.K_c:
+                    self.viewer.clear_manual_catastrophe()
                 elif ev.key == pygame.K_LEFTBRACKET:
                     self.viewer.adjust_selected_cell_base_zone(-self.viewer.base_zone_edit_step)
                 elif ev.key == pygame.K_RIGHTBRACKET:
@@ -1503,11 +1611,111 @@ class Viewer:
         self._cached_agent_map: Dict[int, tuple] = {}
         self._last_state_refresh_frame = -10
         self._last_pick_refresh_frame = -10
+        self._last_zone_visual_signature = None
 
     def set_zone_status(self, message: str, color_key: str = "text_dim") -> None:
         """Store a short zone-related status line for the side-panel inspector."""
         self.zone_status_message = str(message)
         self.zone_status_color_key = str(color_key)
+
+    def get_catastrophe_status(self) -> Dict[str, Any]:
+        """Return a viewer-friendly catastrophe status payload."""
+        if self.engine is None or not hasattr(self.engine, "catastrophe_status"):
+            return {
+                "active": False,
+                "type_name": None,
+                "display_name": "None",
+                "start_tick": None,
+                "duration_ticks": 0,
+                "remaining_ticks": 0,
+                "elapsed_ticks": 0,
+                "active_cell_count": 0,
+                "locked_cell_count": 0,
+                "metadata": {},
+            }
+        status = dict(self.engine.catastrophe_status())
+        status["display_name"] = _catastrophe_display_name(status)
+        return status
+
+    def _runtime_zone_visual_signature(self):
+        """Return the cache key for catastrophe-driven world-overlay changes."""
+        return _catastrophe_status_signature(self.get_catastrophe_status())
+
+    def _refresh_zone_render_cache_if_needed(self) -> None:
+        """Refresh the static terrain cache when catastrophe-driven visuals change."""
+        signature = self._runtime_zone_visual_signature()
+        if signature != self._last_zone_visual_signature:
+            self._refresh_zone_render_cache()
+            self._last_zone_visual_signature = signature
+
+    def _current_canonical_base_zone_map(self) -> Optional[torch.Tensor]:
+        """Return the canonical signed base-zone map used to derive manual catastrophes."""
+        if self.engine is None:
+            return None
+        zones = getattr(self.engine, "zones", None)
+        if zones is not None:
+            base_map = getattr(zones, "base_zone_value_map", None)
+            if base_map is not None:
+                return base_map
+            heal_mask = getattr(zones, "heal_mask", None)
+            if heal_mask is not None:
+                return heal_mask.to(dtype=torch.float32)
+        return getattr(self.engine, "_z_base_values", None)
+
+    def trigger_manual_catastrophe(self, preset_key: str) -> bool:
+        """Build and activate one concrete Patch-5 catastrophe preset from the viewer."""
+        if self.engine is None or not hasattr(self.engine, "activate_catastrophe"):
+            self.set_zone_status("No running engine is attached to the viewer.", "warn")
+            return False
+
+        base_map = self._current_canonical_base_zone_map()
+        if base_map is None:
+            self.set_zone_status("No canonical base-zone map is available for catastrophe triggering.", "warn")
+            return False
+
+        previous_status = self.get_catastrophe_status()
+        try:
+            spec = build_manual_catastrophe_spec(
+                preset_key,
+                base_zone_value_map=base_map,
+            )
+            self.engine.activate_catastrophe(spec, replace_existing=True)
+            self._refresh_zone_render_cache()
+            self._last_zone_visual_signature = self._runtime_zone_visual_signature()
+            current_status = self.get_catastrophe_status()
+            if previous_status.get("active", False):
+                msg = (
+                    f"Replaced catastrophe {previous_status['display_name']} -> {current_status['display_name']} "
+                    f"({int(current_status.get('remaining_ticks', 0))}/{int(current_status.get('duration_ticks', 0))} ticks)."
+                )
+            else:
+                msg = (
+                    f"Activated catastrophe {current_status['display_name']} "
+                    f"({int(current_status.get('remaining_ticks', 0))}/{int(current_status.get('duration_ticks', 0))} ticks)."
+                )
+            self.set_zone_status(msg, "warn")
+            return True
+        except Exception as ex:
+            self.set_zone_status(f"Catastrophe trigger failed: {type(ex).__name__}: {ex}", "warn")
+            return False
+
+    def clear_manual_catastrophe(self) -> bool:
+        """Clear the currently active catastrophe from the viewer."""
+        if self.engine is None or not hasattr(self.engine, "clear_active_catastrophe"):
+            self.set_zone_status("No running engine is attached to the viewer.", "warn")
+            return False
+        try:
+            payload = self.engine.clear_active_catastrophe(reason="manual_viewer_clear")
+            if payload is None:
+                self.set_zone_status("No active catastrophe to clear.", "text_dim")
+                return False
+            self._refresh_zone_render_cache()
+            self._last_zone_visual_signature = self._runtime_zone_visual_signature()
+            self.set_zone_status("Cleared active catastrophe.", "green")
+            return True
+        except Exception as ex:
+            self.set_zone_status(f"Catastrophe clear failed: {type(ex).__name__}: {ex}", "warn")
+            return False
 
     def save_selected_brain(self):
         """Save the PyTorch `state_dict` of the selected agent's brain to disk."""
@@ -1545,13 +1753,11 @@ class Viewer:
         """
         Return inspection information for the currently selected cell.
 
-        This is the operator-facing truth surface for Patch 3:
-        - cell coordinates
-        - terrain / occupant context
-        - raw canonical base-zone value
-        - qualitative signed-zone label
-        - CP mask membership
-        - future edit-lock state
+        Patch-5 extension:
+        - keep canonical base-zone truth visible
+        - also expose the runtime-effective value seen by agents during an active catastrophe
+        - report whether the current catastrophe applies at this cell
+        - report whether base-zone editing is locked right now
         """
         if self.selected_cell is None:
             return None
@@ -1581,8 +1787,13 @@ class Viewer:
             occupant_label = "Occupant: Blue Agent"
 
         base_value = 0.0
+        effective_value = 0.0
         cp_indices: List[int] = []
         edit_locked = False
+        catastrophe_applies_here = False
+        catastrophe_locked_here = False
+        catastrophe_status = self.get_catastrophe_status()
+
         zones = getattr(self.engine, "zones", None) if self.engine is not None else None
         if zones is not None:
             try:
@@ -1608,6 +1819,29 @@ class Viewer:
                 except Exception:
                     continue
 
+        effective_value = float(base_value)
+        if self.engine is not None:
+            try:
+                effective_map = getattr(self.engine, "_z_effective_values", None)
+                if effective_map is not None:
+                    effective_value = float(effective_map[gy, gx].item())
+            except Exception:
+                effective_value = float(base_value)
+
+            try:
+                apply_mask = getattr(self.engine, "_z_catastrophe_apply_mask", None)
+                if apply_mask is not None:
+                    catastrophe_applies_here = bool(apply_mask[gy, gx].item())
+            except Exception:
+                catastrophe_applies_here = False
+
+            try:
+                lock_mask = getattr(self.engine, "_z_catastrophe_edit_lock_mask", None)
+                if lock_mask is not None:
+                    catastrophe_locked_here = bool(lock_mask[gy, gx].item())
+            except Exception:
+                catastrophe_locked_here = False
+
         return {
             "cell": (gx, gy),
             "terrain_label": terrain_label,
@@ -1616,8 +1850,14 @@ class Viewer:
             "slot_id": slot_id,
             "base_value": float(max(-1.0, min(1.0, base_value))),
             "state_label": _zone_state_label(base_value),
+            "effective_value": float(max(-1.0, min(1.0, effective_value))),
+            "effective_state_label": _zone_state_label(effective_value),
             "cp_indices": cp_indices,
             "edit_locked": bool(edit_locked),
+            "catastrophe_active": bool(catastrophe_status.get("active", False)),
+            "catastrophe_display_name": catastrophe_status.get("display_name", "None"),
+            "catastrophe_applies_here": bool(catastrophe_applies_here),
+            "catastrophe_locked_here": bool(catastrophe_locked_here),
         }
 
     def _refresh_zone_render_cache(self) -> None:
@@ -1643,6 +1883,14 @@ class Viewer:
             return False
         if self.engine is None or getattr(self.engine, "zones", None) is None:
             self.set_zone_status("No zone container is attached to the running engine.", "warn")
+            return False
+
+        catastrophe_status = self.get_catastrophe_status()
+        if bool(catastrophe_status.get("active", False)):
+            self.set_zone_status(
+                f"Base-zone editing is locked while catastrophe {catastrophe_status['display_name']} is active.",
+                "warn",
+            )
             return False
 
         gx, gy = info["cell"]
@@ -1785,6 +2033,7 @@ class Viewer:
         self.minimap = Minimap(self)
 
         self.world_renderer.build_static_cache(engine)
+        self._last_zone_visual_signature = self._runtime_zone_visual_signature()
         self._install_score_hook(engine, registry)
 
         running = True
@@ -1862,6 +2111,8 @@ class Viewer:
                         keep_last_n=int(getattr(config, "CHECKPOINT_KEEP_LAST_N", 1)),
                     )
 
+            self._refresh_zone_render_cache_if_needed()
+
             if (frame_count - self._last_state_refresh_frame) >= self.STATE_REFRESH_EVERY_FRAMES:
                 self._refresh_state_cpu()
                 self._last_state_refresh_frame = frame_count
@@ -1886,4 +2137,5 @@ class Viewer:
                 running = False
 
         pygame.quit()
+
 
