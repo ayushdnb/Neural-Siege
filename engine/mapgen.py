@@ -76,17 +76,22 @@ class Zones:
     """
     Canonical semantic-zone container kept off-grid to avoid renderer/engine churn.
 
-    Patch-1 contract:
-    -----------------
+    Patch-1 / Patch-3 contract:
+    ---------------------------
     The simulation is moving away from a heal-only zone model toward a more
     general signed base-zone representation. This class is the foundational seam
     for that refactor:
 
       • `base_zone_value_map` is the canonical persistent zone field
       • positive values represent beneficial/heal-like base zones
-      • negative values are reserved for future harmful/poison-like semantics
+      • negative values represent harmful/poison-like base zones
       • zero means dormant / no base-zone effect
       • capture-point logic remains separate in `cp_masks`
+
+    Patch 3 adds a minimal operator-facing editing seam:
+    - viewer edits target the canonical base layer only
+    - edits clamp into [-1, +1]
+    - optional future lock masks can block edits without redefining the base map
 
     Why keep zones off-grid?
     ------------------------
@@ -101,6 +106,7 @@ class Zones:
       read-only consumers (viewer, old summaries, older checkpoint readers) can
       still treat positive base zones as classic heal tiles.
     - Capture-point masks stay boolean and behaviorally unchanged.
+    - Catastrophe override logic is intentionally NOT implemented yet.
 
     Data invariants:
     ---------------
@@ -200,6 +206,90 @@ class Zones:
     def cp_count(self) -> int:
         """Return the number of distinct capture-point masks."""
         return len(self.cp_masks)
+
+    @property
+    def base_zone_edit_locked_mask(self) -> torch.Tensor:
+        """
+        Return a boolean mask of cells currently locked against manual base-zone edits.
+
+        Patch-3 default behavior:
+        - catastrophe override logic does not exist yet
+        - therefore the default lock mask is all-False
+
+        Forward-compatibility hook:
+        - a later subsystem may inject `_base_zone_edit_locked_mask`
+        - the viewer can consult this property without knowing who set it
+        """
+        mask = getattr(self, "_base_zone_edit_locked_mask", None)
+        if mask is None:
+            return torch.zeros_like(self.base_zone_value_map, dtype=torch.bool)
+        if not torch.is_tensor(mask):
+            raise TypeError("_base_zone_edit_locked_mask must be a torch.Tensor when provided")
+        if tuple(mask.shape) != tuple(self.base_zone_value_map.shape):
+            raise ValueError(
+                f"_base_zone_edit_locked_mask shape {tuple(mask.shape)} does not match base zone shape {tuple(self.base_zone_value_map.shape)}"
+            )
+        return mask.to(device=self.base_zone_value_map.device, dtype=torch.bool)
+
+    def _validate_xy(self, x: int, y: int) -> tuple[int, int]:
+        """Normalize and bounds-check one grid coordinate pair."""
+        xi = int(x)
+        yi = int(y)
+        H, W = int(self.base_zone_value_map.shape[0]), int(self.base_zone_value_map.shape[1])
+        if not (0 <= xi < W and 0 <= yi < H):
+            raise IndexError(f"base-zone coordinate out of bounds: ({xi}, {yi}) for grid {(W, H)}")
+        return xi, yi
+
+    def is_base_zone_edit_locked_at(self, x: int, y: int) -> bool:
+        """Return True when manual editing should be rejected at one cell."""
+        xi, yi = self._validate_xy(x, y)
+        return bool(self.base_zone_edit_locked_mask[yi, xi].item())
+
+    def get_base_zone_value_at(self, x: int, y: int) -> float:
+        """Return the canonical signed base-zone value at one cell."""
+        xi, yi = self._validate_xy(x, y)
+        return float(self.base_zone_value_map[yi, xi].item())
+
+    def set_base_zone_value_at(
+        self,
+        x: int,
+        y: int,
+        value: float,
+        *,
+        respect_edit_lock: bool = True,
+    ) -> float:
+        """
+        Set one cell in the canonical base-zone layer and return the stored value.
+
+        Guarantees:
+        - clamps to [-1, +1]
+        - edits the canonical persistent base layer only
+        - optionally respects a future edit-lock mask
+        """
+        xi, yi = self._validate_xy(x, y)
+        if respect_edit_lock and self.is_base_zone_edit_locked_at(xi, yi):
+            raise RuntimeError(f"base-zone cell ({xi}, {yi}) is locked for manual editing")
+
+        v = float(max(-1.0, min(1.0, float(value))))
+        self.base_zone_value_map[yi, xi] = v
+        return float(self.base_zone_value_map[yi, xi].item())
+
+    def add_base_zone_delta_at(
+        self,
+        x: int,
+        y: int,
+        delta: float,
+        *,
+        respect_edit_lock: bool = True,
+    ) -> float:
+        """Add a delta to one cell in the canonical base-zone layer."""
+        current = self.get_base_zone_value_at(x, y)
+        return self.set_base_zone_value_at(
+            x,
+            y,
+            current + float(delta),
+            respect_edit_lock=respect_edit_lock,
+        )
 
     def checkpoint_base_zones_payload(self) -> Dict[str, Any]:
         """
@@ -565,3 +655,4 @@ def make_zones(
 
     # Package into the canonical Zones dataclass and return.
     return Zones(base_zone_value_map=base_zone_value_map, cp_masks=cp_masks)
+

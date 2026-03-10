@@ -90,7 +90,7 @@ from engine.agent_registry import (
 # ==============================================================================
 # Constants & colour palette
 # ==============================================================================
-FONT_NAME = "consolas"
+FONT_NAME = str(getattr(config, "UI_FONT_NAME", "consolas"))
 
 # Colors stored as (R, G, B). Some overlays use (R, G, B, A) for alpha blending.
 # In Pygame:
@@ -116,9 +116,16 @@ COLORS = {
     "blue_archer":  (22, 160, 133),
     "blue":         (52, 152, 219),
 
+    # Signed-zone palette
+    "zone_positive": (46, 204, 113),
+    "zone_negative": (155, 89, 182),
+    "zone_dormant": (108, 116, 132),
+    "zone_locked": (241, 196, 15),
+
     # UI accents
     "archer_glyph": (245, 230, 90),
     "marker": (242, 228, 92),
+    "selected": (242, 228, 92),
 
     "text": (230, 230, 230),
     "text_dim": (180, 186, 194),
@@ -139,7 +146,6 @@ COLORS = {
 
 # Semi-transparent overlays (all include alpha channel).
 OVERLAYS = {
-    "heal": (46, 204, 113, 60),
     "cp": (210, 210, 230, 48),
 
     # Control point outline colors:
@@ -207,6 +213,52 @@ def _rgb(col) -> tuple[int, int, int]:
     except Exception:
         pass
     return (_clamp_u8(r), _clamp_u8(g), _clamp_u8(b))
+
+
+def _blend_rgb(base_rgb, tint_rgb, alpha_01: float) -> tuple[int, int, int]:
+    """
+    Alpha-blend `tint_rgb` over `base_rgb` using a normalized alpha in [0,1].
+
+    This is used for signed-zone terrain rendering so the operator sees the
+    underlying terrain while still reading positive / negative / dormant zone
+    state honestly.
+    """
+    a = max(0.0, min(1.0, float(alpha_01)))
+    br, bg, bb = _rgb(base_rgb)
+    tr, tg, tb = _rgb(tint_rgb)
+    return (
+        _clamp_u8(round(br * (1.0 - a) + tr * a)),
+        _clamp_u8(round(bg * (1.0 - a) + tg * a)),
+        _clamp_u8(round(bb * (1.0 - a) + tb * a)),
+    )
+
+
+def _zone_state_label(value: float, eps: float = 1e-6) -> str:
+    """Return a qualitative signed-zone label from one scalar value."""
+    v = float(value)
+    if v > eps:
+        return "Beneficial"
+    if v < -eps:
+        return "Harmful"
+    return "Dormant"
+
+
+def _zone_overlay_rgb_alpha(value: float, *, dormant_alpha: float = 0.05) -> tuple[tuple[int, int, int], float]:
+    """
+    Convert one signed base-zone value into a tint colour and normalized alpha.
+
+    Rendering policy for Patch 3:
+    - positive values: green tint, stronger with magnitude
+    - negative values: purple tint, stronger with magnitude
+    - zero / near-zero: faint neutral tint so dormant cells remain visually distinct
+    """
+    v = float(value)
+    mag = max(0.0, min(1.0, abs(v)))
+    if v > 1e-6:
+        return COLORS["zone_positive"], 0.10 + 0.28 * mag
+    if v < -1e-6:
+        return COLORS["zone_negative"], 0.10 + 0.28 * mag
+    return COLORS["zone_dormant"], dormant_alpha
 
 
 # ==============================================================================
@@ -395,19 +447,12 @@ class WorldRenderer:
     """
     Draws the world grid, agents, and overlays into the Pygame window.
 
-    PERFORMANCE STRATEGY:
-    - We draw static terrain (walls, empties, heal zones) into a cached Surface.
-      This is expensive because it loops over grid cells.
-    - We rebuild this cache only when needed:
-        - viewport size changes
-        - zoom changes
-        - terrain changes
-    - Dynamic items (agents, HP bars, rays) are drawn every frame.
-
-    Inputs:
-    - viewer (has camera, flags, text cache)
-    - grid tensor (PyTorch)
-    - registry (per-agent tensor state)
+    Patch-3 rendering policy:
+    - signed base zones are rendered from the canonical base field
+    - positive / negative / dormant cells are visually distinct
+    - capture-point rendering stays separate
+    - manual viewer edits target only the canonical base layer and invalidate the
+      cached terrain surface deterministically
     """
 
     def __init__(self, viewer, grid, registry):
@@ -420,91 +465,119 @@ class WorldRenderer:
         self.static_surf = None
 
         # Precomputed zone info extracted from engine.zones
-        self._zone_cache = {"heal_tiles": [], "cp_rects": []}
+        self._zone_cache = {
+            "base_np": None,
+            "edit_locked_np": None,
+            "cp_rects": [],
+        }
 
     def build_static_cache(self, engine):
         """
-        Extract heal tiles and control point bounding boxes from engine.zones.
+        Extract signed base-zone values and control-point rectangles from `engine.zones`.
 
         Why:
-        - The zones are derived from masks (boolean tensors) and don't change often.
-        - We convert them to CPU lists of coordinates / rectangles once.
+        - the renderer wants CPU-side arrays so static terrain can be rebuilt
+          without per-cell GPU reads
+        - the canonical source of truth is now `base_zone_value_map`, not `heal_mask`
+        - a later catastrophe patch can optionally provide an edit-lock mask
         """
         self.static_surf = None  # force rebuild of background
-        self._zone_cache = {"heal_tiles": [], "cp_rects": []}
+
+        H, W = int(self.grid.shape[1]), int(self.grid.shape[2])
+        base_np = np.zeros((H, W), dtype=np.float32)
+        edit_locked_np = np.zeros((H, W), dtype=np.bool_)
+        cp_rects: List[tuple[int, int, int, int]] = []
 
         zones = getattr(engine, "zones", None)
-        if zones:
-            # Heal zone: boolean mask -> list of (x,y) tiles
-            if getattr(zones, "heal_mask", None) is not None:
-                ys, xs = torch.nonzero(zones.heal_mask, as_tuple=True)
-                self._zone_cache["heal_tiles"] = list(
-                    zip(xs.cpu().tolist(), ys.cpu().tolist())
-                )
+        if zones is not None:
+            try:
+                base_map = getattr(zones, "base_zone_value_map", None)
+                if base_map is None and getattr(zones, "heal_mask", None) is not None:
+                    base_map = getattr(zones, "heal_mask").to(dtype=torch.float32)
+                if base_map is not None:
+                    base_np = base_map.detach().to(dtype=torch.float32).cpu().numpy()
+            except Exception:
+                pass
+
+            try:
+                if hasattr(zones, "base_zone_edit_locked_mask"):
+                    edit_locked_np = (
+                        zones.base_zone_edit_locked_mask
+                        .detach()
+                        .bool()
+                        .cpu()
+                        .numpy()
+                    )
+            except Exception:
+                edit_locked_np = np.zeros((H, W), dtype=np.bool_)
 
             # Control points: each cp_mask -> bounding rectangle (x0,y0,x1,y1)
             for m in getattr(zones, "cp_masks", []):
                 ys, xs = torch.nonzero(m, as_tuple=True)
                 if xs.numel() > 0:
-                    self._zone_cache["cp_rects"].append(
-                        (xs.min().item(), ys.min().item(),
-                         xs.max().item() + 1, ys.max().item() + 1)
+                    cp_rects.append(
+                        (xs.min().item(), ys.min().item(), xs.max().item() + 1, ys.max().item() + 1)
                     )
+
+        self._zone_cache = {
+            "base_np": base_np,
+            "edit_locked_np": edit_locked_np,
+            "cp_rects": cp_rects,
+        }
 
     def _draw_static_background(self):
         """
-        Render walls, empty cells, and heal zones onto a static surface.
+        Render walls, empty cells, and signed base-zone tint onto a static surface.
 
-        KEY DETAIL:
-        - We draw into a surface sized to the world_rect.
-        - We use camera transforms world_to_screen to place cells.
-
-        NOTE:
-        - This loops over every cell in the grid (O(H*W)).
-        - Therefore we do NOT want to call it every frame.
+        Important details:
+        - signed zone truth comes from the canonical base-zone value map
+        - dormant cells receive a faint neutral tint so zero is still visible
+        - capture points are NOT baked into this surface; they remain a separate overlay
         """
         wrect = self.viewer.layout.world_rect()
         self.static_surf = pygame.Surface(wrect.size)
         self.static_surf.fill(COLORS["bg"])
 
-        # Grid layout: grid tensor is typically (C, H, W)
         H, W = self.grid.shape[1], self.grid.shape[2]
-
-        # We only need occupancy channel for terrain rendering.
-        # This is an expensive GPU->CPU sync; done only when rebuilding static surf.
         occ_np = self.grid[0].detach().cpu().numpy()
+        base_np = self._zone_cache.get("base_np", None)
+        edit_locked_np = self._zone_cache.get("edit_locked_np", None)
+        show_zone_overlay = bool(getattr(self.viewer, "show_zone_overlay", True))
 
-        # Draw each cell: empty (0) or wall (1)
         for y in range(H):
             for x in range(W):
-                occ = occ_np[y, x]
-                if occ in {0, 1}:
-                    color = COLORS["empty"] if occ == 0 else COLORS["wall"]
-                    cx, cy = self.cam.world_to_screen(x, y)
+                occ = int(occ_np[y, x])
+                terrain_color = COLORS["wall"] if occ == 1 else COLORS["empty"]
+                color = terrain_color
+
+                if show_zone_overlay and base_np is not None and occ != 1:
+                    tint_rgb, tint_alpha = _zone_overlay_rgb_alpha(float(base_np[y, x]))
+                    color = _blend_rgb(terrain_color, tint_rgb, tint_alpha)
+
+                cx, cy = self.cam.world_to_screen(x, y)
+                pygame.draw.rect(
+                    self.static_surf,
+                    color,
+                    (cx, cy, self.cam.cell_px, self.cam.cell_px),
+                )
+
+                if (
+                    show_zone_overlay
+                    and edit_locked_np is not None
+                    and occ != 1
+                    and bool(edit_locked_np[y, x])
+                    and self.cam.cell_px >= 5
+                ):
                     pygame.draw.rect(
                         self.static_surf,
-                        color,
+                        COLORS["zone_locked"],
                         (cx, cy, self.cam.cell_px, self.cam.cell_px),
+                        1,
                     )
-
-        # Heal zones drawn as alpha overlay (separate surface with SRCALPHA)
-        overlay = pygame.Surface(wrect.size, pygame.SRCALPHA)
-        for x, y in self._zone_cache["heal_tiles"]:
-            cx, cy = self.cam.world_to_screen(x, y)
-            pygame.draw.rect(
-                overlay,
-                OVERLAYS["heal"],
-                (cx, cy, self.cam.cell_px, self.cam.cell_px),
-            )
-        self.static_surf.blit(overlay, (0, 0))
 
     def draw(self, surf, state_data):
         """
         Draw the entire world.
-
-        Parameters:
-        - surf: the main screen Surface
-        - state_data: CPU cached dictionary from Viewer._refresh_state_cpu()
 
         Expected keys in state_data:
         - "occ_np": occupancy grid as numpy (H,W)
@@ -514,31 +587,18 @@ class WorldRenderer:
         """
         wrect = self.viewer.layout.world_rect()
 
-        # Ensure static background exists and matches current viewport size
         if self.static_surf is None or self.static_surf.get_size() != wrect.size:
             self._draw_static_background()
 
-        # 1) Blit static background into the world rect
         surf.blit(self.static_surf, wrect.topleft)
-
-        # Cell size in pixels (depends on camera zoom)
         c = self.cam.cell_px
 
-        # ----------------------------------------------------------------------
-        # Control point outlines
-        # ----------------------------------------------------------------------
-        # Draw into an alpha surface so we can overlay semi-transparent outlines.
         cp_overlay = pygame.Surface(wrect.size, pygame.SRCALPHA)
-
         for x0, y0, x1, y1 in self._zone_cache["cp_rects"]:
-            # Determine which team controls the control point by counting tiles
-            # inside this region in occupancy map:
-            #   2 => red team, 3 => blue team (project convention)
             patch = state_data["occ_np"][y0:y1, x0:x1]
             red_cnt = (patch == 2).sum()
             blue_cnt = (patch == 3).sum()
 
-            # Pick outline color and label
             if red_cnt > blue_cnt:
                 b_col, label = OVERLAYS["outline_red"], ("R", COLORS["red"])
             elif blue_cnt > red_cnt:
@@ -546,48 +606,26 @@ class WorldRenderer:
             else:
                 b_col, label = OVERLAYS["outline_neutral"], ("–", COLORS["text_dim"])
 
-            # Convert world rectangle corners to screen positions
             cx0, cy0 = self.cam.world_to_screen(x0, y0)
             cx1, cy1 = self.cam.world_to_screen(x1, y1)
-
             rect = pygame.Rect(cx0, cy0, cx1 - cx0, cy1 - cy0)
-
-            # Outline thickness scales with zoom/cell size (at least 1 px)
             pygame.draw.rect(cp_overlay, b_col, rect, max(1, c // 2))
-
-            # Label in the center of the rect
             lab_surf = self.viewer.text_cache.render(label[0], 13, label[1])
             cp_overlay.blit(lab_surf, lab_surf.get_rect(center=rect.center))
 
         surf.blit(cp_overlay, wrect.topleft)
 
-        # ----------------------------------------------------------------------
-        # Agents
-        # ----------------------------------------------------------------------
         for slot_id in state_data["alive_indices"]:
             entry = state_data["agent_map"].get(slot_id, None)
             if entry is None:
                 continue
 
             x, y, unit, team, _uid, _btype = entry
-
-            # Choose color based on (team, unit)
-            # Convention:
-            # - team 2.0 = red
-            # - team 3.0 = blue
-            # - unit 1.0 = soldier
-            # - unit 2.0 = archer
             color_key = f"{'red' if team == 2.0 else 'blue'}_{'archer' if unit == 2.0 else 'soldier'}"
             color = COLORS[color_key]
-
-            # Convert world cell to pixel coords
             cx, cy = self.cam.world_to_screen(int(x), int(y))
-
-            # NOTE: For agents we draw directly into `surf`, but offset by world_rect
-            # because world_to_screen is relative to the world surface coordinates.
             pygame.draw.rect(surf, color, (wrect.x + cx, wrect.y + cy, c, c))
 
-            # If archer and cell is big enough, draw an inner circle glyph
             if unit == 2.0 and c > 4:
                 pygame.draw.circle(
                     surf,
@@ -597,9 +635,6 @@ class WorldRenderer:
                     max(1, c // 6),
                 )
 
-        # ----------------------------------------------------------------------
-        # Optional overlays controlled by flags/toggles
-        # ----------------------------------------------------------------------
         if self.viewer.battle_view_enabled:
             self._draw_hp_bars(surf, wrect, c, state_data)
         if self.viewer.show_brain_types:
@@ -609,12 +644,10 @@ class WorldRenderer:
         if self.viewer.show_grid and c >= 6:
             self._draw_grid_lines(surf, wrect, c)
 
-        # Markers always drawn (but only if viewer.marked is non-empty)
         self._draw_markers(surf, wrect, c, state_data["id_np"])
-
-        # Rays depend on selected agent + toggle
         if self.viewer.show_rays:
             self._draw_rays(surf, wrect, c, state_data)
+        self._draw_selected_cell(surf, wrect, c)
 
     def _draw_hp_bars(self, surf, wrect, c, state_data):
         """
@@ -622,9 +655,6 @@ class WorldRenderer:
 
         Rendering note:
         - Bars are drawn only if the cell is large enough, otherwise it becomes noise.
-
-        Math note:
-        - hp_ratio = hp / hp_max in [0,1]
         """
         if c < 8:
             return
@@ -637,34 +667,21 @@ class WorldRenderer:
                 continue
 
             x, y, _unit, _team, _uid, _btype = entry
-
             hp_max = float(self.registry.agent_data[slot_id, COL_HP_MAX].item())
             hp = float(self.registry.agent_data[slot_id, COL_HP].item())
-
             hp_ratio_raw = (hp / hp_max) if hp_max > 0 else 0.0
-            hp_ratio = max(0.0, min(1.0, hp_ratio_raw))  # clamp [0,1]
-
+            hp_ratio = max(0.0, min(1.0, hp_ratio_raw))
             cx, cy = self.cam.world_to_screen(int(x), int(y))
-
             bar_w, bar_h = c, max(1, c // 8)
             bar_y = cy - bar_h - 2
-
-            # Basic bounds check to avoid drawing off-surface
             if 0 <= bar_y < wrect.height and 0 <= cx < wrect.width:
-                # background
                 pygame.draw.rect(hp_bar_surf, (50, 50, 50), (cx, bar_y, bar_w, bar_h))
-                # foreground proportionally filled
                 pygame.draw.rect(hp_bar_surf, COLORS["green"], (cx, bar_y, bar_w * hp_ratio, bar_h))
 
         surf.blit(hp_bar_surf, wrect.topleft)
 
     def _draw_brain_labels(self, surf, wrect, c, state_data):
-        """
-        Draw small labels inside agent cells indicating brain type.
-
-        - We use a scaled font size relative to cell size.
-        - btype is a short string like "T", "M", "Tr", "U", etc.
-        """
+        """Draw small labels inside agent cells indicating brain type."""
         if c < 8:
             return
 
@@ -674,29 +691,18 @@ class WorldRenderer:
                 continue
 
             x, y, _unit, _team, _uid, btype = entry
-
             cx, cy = self.cam.world_to_screen(int(x), int(y))
             if 0 <= cx < wrect.width and 0 <= cy < wrect.height:
                 font_size = max(10, min(16, c // 2))
                 lab_surf = self.viewer.text_cache.render(btype, font_size, COLORS["text"])
-                rect = lab_surf.get_rect(
-                    center=(wrect.x + cx + c // 2, wrect.y + cy + c // 2)
-                )
+                rect = lab_surf.get_rect(center=(wrect.x + cx + c // 2, wrect.y + cy + c // 2))
                 surf.blit(lab_surf, rect)
 
     def _draw_threat_vision(self, surf, wrect, c, state_data):
         """
         Threat vision mode:
-
-        - Draw a vision range circle for the selected agent.
-        - Highlight agents within that range.
-        - Enemies get filled circles whose size/alpha depends on their HP ratio.
-        - Allies get a small outlined circle.
-
-        Geometry note:
-        - Distance computed using Euclidean norm:
-            dist = sqrt((dx)^2 + (dy)^2)
-          implemented via numpy.hypot(dx, dy).
+        - draw a vision range circle for the selected agent
+        - highlight agents within that range
         """
         slot_id = self.viewer.selected_slot_id
         if slot_id is None or slot_id not in state_data["agent_map"]:
@@ -705,11 +711,9 @@ class WorldRenderer:
         my_x, my_y, _unit, my_team, _uid, _btype = state_data["agent_map"][slot_id]
         my_x = float(my_x)
         my_y = float(my_y)
-
         my_cx, my_cy = self.cam.world_to_screen(int(my_x), int(my_y))
-
         vision_range = float(self.registry.agent_data[slot_id, COL_VISION].item())
-        vision_px = int(vision_range * c)  # convert cells -> pixels
+        vision_px = int(vision_range * c)
 
         overlay = pygame.Surface(wrect.size, pygame.SRCALPHA)
         center_px = (my_cx + c // 2, my_cy + c // 2)
@@ -722,48 +726,26 @@ class WorldRenderer:
             dist = float(np.hypot(ox - my_x, oy - my_y))
             if dist <= vision_range:
                 o_cx, o_cy = self.cam.world_to_screen(int(ox), int(oy))
-
                 hp_max = float(self.registry.agent_data[other_id, COL_HP_MAX].item())
                 hp = float(self.registry.agent_data[other_id, COL_HP].item())
                 hp_ratio = (hp / hp_max) if hp_max > 0 else 0.0
 
                 if o_team != my_team:
-                    # Enemy: circle scales with hp_ratio; alpha scales with hp_ratio
                     radius = int(c * 0.7 * (0.5 + hp_ratio * 0.5))
                     alpha = _clamp_u8(50 + 150 * hp_ratio)
                     r, g, b = _rgb(OVERLAYS["threat_enemy"])
-                    pygame.draw.circle(
-                        overlay, (r, g, b, alpha),
-                        (o_cx + c // 2, o_cy + c // 2),
-                        radius
-                    )
+                    pygame.draw.circle(overlay, (r, g, b, alpha), (o_cx + c // 2, o_cy + c // 2), radius)
                 else:
-                    # Ally: small outlined circle
                     r, g, b = _rgb(OVERLAYS["threat_ally"])
-                    pygame.draw.circle(
-                        overlay, (r, g, b, 100),
-                        (o_cx + c // 2, o_cy + c // 2),
-                        int(c * 0.4),
-                        1
-                    )
+                    pygame.draw.circle(overlay, (r, g, b, 100), (o_cx + c // 2, o_cy + c // 2), int(c * 0.4), 1)
 
         surf.blit(overlay, wrect.topleft)
 
     def _draw_grid_lines(self, surf, wrect, c):
-        """
-        Draw grid overlay lines.
-
-        Math note:
-        - We compute offsets so grid lines align with world cell boundaries even
-          when camera has non-integer offsets.
-        """
+        """Draw grid overlay lines aligned to cell boundaries."""
         ax, ay = self.cam.world_to_screen(0, 0)
-
-        # We want the first grid line to start at the next multiple of `c`
-        # relative to the world rect, hence modulo arithmetic.
         off_x = (c - (ax % c)) % c
         off_y = (c - (ay % c)) % c
-
         x = wrect.x + off_x
         y = wrect.y + off_y
 
@@ -778,14 +760,7 @@ class WorldRenderer:
         pygame.draw.rect(surf, COLORS["border"], wrect, 2)
 
     def _draw_markers(self, surf, wrect, c, id_np):
-        """
-        Draw a marker around marked agents (toggled by 'M').
-
-        Implementation note:
-        - We locate marked slot ids in the id grid (id_np) using numpy.
-        - This is O(H*W) per agent if done naively; here we use argwhere which is
-          also potentially heavy, but the marked list is limited (<= 10).
-        """
+        """Draw a marker around explicitly marked agents."""
         for slot_id in self.viewer.marked:
             pos = np.argwhere(id_np == slot_id)
             if pos.size > 0:
@@ -799,21 +774,7 @@ class WorldRenderer:
                 )
 
     def _draw_rays(self, surf, wrect, c, state_data):
-        """
-        Draw line-of-sight rays from selected agent.
-
-        Algorithm:
-        - Cast N rays in evenly spaced angles around 2π radians.
-        - For each ray:
-            - Step forward cell-by-cell up to vision_range.
-            - Stop at boundary, wall, or agent.
-            - Choose color based on what it hits.
-        - Draw a line from agent center to hit point.
-
-        Complexity:
-        - O(num_rays * vision_range)
-        Typical values are small (e.g., 32 rays, range maybe ~8-20).
-        """
+        """Draw line-of-sight rays from the selected agent."""
         slot_id = self.viewer.selected_slot_id
         if slot_id is None or slot_id not in state_data["agent_map"]:
             return
@@ -821,32 +782,24 @@ class WorldRenderer:
         agent_x, agent_y, _unit, my_team, _uid, _btype = state_data["agent_map"][slot_id]
         agent_x = float(agent_x)
         agent_y = float(agent_y)
-
-        # Start position in screen pixels (center of agent cell)
         start_pos_screen = (
             wrect.x + self.cam.world_to_screen(int(agent_x), int(agent_y))[0] + c // 2,
             wrect.y + self.cam.world_to_screen(int(agent_x), int(agent_y))[1] + c // 2,
         )
-
         vision_range = int(float(self.registry.agent_data[slot_id, COL_VISION].item()))
-
-        occ_grid = state_data["occ_np"]  # occupancy values
+        occ_grid = state_data["occ_np"]
         H, W = occ_grid.shape
-
         num_rays_to_draw = 32
+
         for i in range(num_rays_to_draw):
             angle = i * (2 * math.pi / num_rays_to_draw)
             dx, dy = math.cos(angle), math.sin(angle)
-
             end_x, end_y = agent_x, agent_y
             color = RAY_COLORS["empty"]
 
             for step in range(1, vision_range + 1):
-                # Ray marching: test at each integer step
                 test_x = int(round(agent_x + dx * step))
                 test_y = int(round(agent_y + dy * step))
-
-                # Stop if outside map
                 if not (0 <= test_x < W and 0 <= test_y < H):
                     end_x, end_y = test_x, test_y
                     break
@@ -855,15 +808,12 @@ class WorldRenderer:
                 if occupant != 0:
                     end_x, end_y = test_x, test_y
                     if occupant == 1:
-                        # Hit wall
                         color = RAY_COLORS["wall"]
                     else:
-                        # Hit an agent/team-occupied cell
                         hit_team = occupant
                         color = RAY_COLORS["enemy"] if my_team != hit_team else RAY_COLORS["ally"]
                     break
             else:
-                # No obstacle found within vision range: extend to max
                 end_x = agent_x + dx * vision_range
                 end_y = agent_y + dy * vision_range
 
@@ -874,7 +824,31 @@ class WorldRenderer:
             )
             pygame.draw.line(surf, color, start_pos_screen, end_pos_screen, 1)
 
+    def _draw_selected_cell(self, surf, wrect, c):
+        """Draw an outline around the currently selected world cell."""
+        info = self.viewer.get_selected_cell_zone_info()
+        if not info:
+            return
 
+        gx, gy = info["cell"]
+        cx, cy = self.cam.world_to_screen(gx, gy)
+        rect = pygame.Rect(wrect.x + cx, wrect.y + cy, c, c)
+
+        if info["edit_locked"]:
+            outline_color = COLORS["zone_locked"]
+        else:
+            label = info["state_label"]
+            if label == "Beneficial":
+                outline_color = COLORS["zone_positive"]
+            elif label == "Harmful":
+                outline_color = COLORS["zone_negative"]
+            else:
+                outline_color = COLORS["selected"]
+
+        pygame.draw.rect(surf, outline_color, rect, max(1, c // 4))
+        if c >= 12:
+            center = (rect.x + rect.width // 2, rect.y + rect.height // 2)
+            pygame.draw.circle(surf, outline_color, center, max(1, c // 8))
 # ==============================================================================
 # HUD Panel (bottom)
 # ==============================================================================
@@ -1047,8 +1021,9 @@ class SidePanel:
     """
     Right panel:
 
-    - Shows selected agent details (pos, HP, atk, vision, brain info, param count).
-    - Shows legend and keyboard controls.
+    - selected agent details
+    - selected cell / signed-zone inspector
+    - legend and keyboard controls
     """
 
     def __init__(self, viewer, registry):
@@ -1066,6 +1041,9 @@ class SidePanel:
             "Red Archer": COLORS["red_archer"],
             "Blue Soldier": COLORS["blue_soldier"],
             "Blue Archer": COLORS["blue_archer"],
+            "Beneficial Zone": COLORS["zone_positive"],
+            "Harmful Zone": COLORS["zone_negative"],
+            "Dormant Zone": COLORS["zone_dormant"],
         }
 
         for label, color in legend_items.items():
@@ -1074,49 +1052,38 @@ class SidePanel:
             y += 22
 
         y += 20
-
         controls = [
             "WASD / Arrows: Pan Camera",
             "Mouse Wheel: Zoom",
-            "Click Agent: Inspect",
+            "Click World: Inspect Cell / Agent",
+            "[ / ]: Decrease / Increase Base Zone",
+            "0 / Backspace: Reset Base Zone",
+            "Z: Toggle Signed-Zone Overlay",
             "SPACE: Pause Simulation",
+            ". : Single Step When Paused",
             "+/-: Change Speed",
             "R: Toggle Agent Rays",
             "T: Toggle Threat Vision",
             "B: Toggle HP Bars",
             "N: Toggle Brain Labels",
+            "M: Mark Selected Agent",
             "S: Save Selected Brain",
             "F9: Manual Checkpoint Save",
             "F11: Toggle Fullscreen",
         ]
-
         for line in controls:
             surf.blit(self.viewer.text_cache.render(line, 13, COLORS["text_dim"]), (x, y))
             y += 18
-
         return y
 
-    def draw(self, surf, state_data):
-        srect = self.viewer.layout.side_rect()
-
-        # Background and border
-        surf.fill(COLORS["side_bg"], srect)
-        pygame.draw.rect(surf, COLORS["border"], srect, 2)
-
-        pad, y = 12, srect.y + 12
-        x = srect.x + pad
-
+    def _draw_agent_section(self, surf, x, y, srect, state_data):
         surf.blit(self.viewer.text_cache.render("Agent Inspector", 18, COLORS["text"]), (x, y))
         y += 30
-
         slot_id = self.viewer.selected_slot_id
 
-        # CASE 1: No selection
         if slot_id is None:
-            surf.blit(self.viewer.text_cache.render("Click an agent to inspect.", 13, COLORS["text_dim"]), (x, y))
+            surf.blit(self.viewer.text_cache.render("No live agent selected.", 13, COLORS["text_dim"]), (x, y))
             y += 30
-
-        # CASE 2: Selected slot but agent died (not in current agent_map)
         elif slot_id not in state_data["agent_map"]:
             uid_str = (
                 f"ID: {self.viewer.last_selected_uid} (Dead)"
@@ -1125,59 +1092,118 @@ class SidePanel:
             )
             surf.blit(self.viewer.text_cache.render(uid_str, 13, COLORS["warn"]), (x, y))
             y += 30
-
-        # CASE 3: Selected and alive
         else:
             _ax, _ay, _u, _t, unique_id, _btype = state_data["agent_map"][slot_id]
             surf.blit(self.viewer.text_cache.render(f"ID: {int(unique_id)}", 16, COLORS["green"]), (x, y))
             y += 24
 
             agent_data = self.registry.agent_data[slot_id]
-
             pos = (int(agent_data[COL_X].item()), int(agent_data[COL_Y].item()))
             hp = float(agent_data[COL_HP].item())
             hp_max = float(agent_data[COL_HP_MAX].item())
             atk = float(agent_data[COL_ATK].item())
             vision = float(agent_data[COL_VISION].item())
-
             hp_ratio = (hp / hp_max) if hp_max > 0 else 0.0
-
             unit_val = float(agent_data[COL_UNIT].item())
             unit_name = "Archer" if unit_val == 2.0 else "Soldier"
-
             brain = self.registry.brains[slot_id]
             brain_name = describe_brain_module(brain)
-
-            # Per-agent accumulated score (tracked via PPO hook)
             agent_score = self.viewer.agent_scores.get(int(unique_id), 0.0)
 
-            surf.blit(self.viewer.text_cache.render(f"Score: {agent_score:.2f}", 13, COLORS["text_dim"]), (x, y)); y += 18
-            surf.blit(self.viewer.text_cache.render(f"Pos: ({pos[0]}, {pos[1]})", 13, COLORS["text_dim"]), (x, y)); y += 18
-            surf.blit(self.viewer.text_cache.render(f"Unit: {unit_name}", 13, COLORS["text_dim"]), (x, y)); y += 18
-            surf.blit(self.viewer.text_cache.render(f"Brain: {brain_name}", 13, COLORS["text_dim"]), (x, y)); y += 18
+            for line in (
+                f"Score: {agent_score:.2f}",
+                f"Pos: ({pos[0]}, {pos[1]})",
+                f"Unit: {unit_name}",
+                f"Brain: {brain_name}",
+            ):
+                surf.blit(self.viewer.text_cache.render(line, 13, COLORS["text_dim"]), (x, y))
+                y += 18
 
-            # HP bar
-            bar_w = srect.width - 2 * pad
+            bar_w = srect.width - 24
             pygame.draw.rect(surf, COLORS["bar_bg"], (x, y, bar_w, 10))
             pygame.draw.rect(surf, COLORS["bar_fg"], (x, y, bar_w * hp_ratio, 10))
             y += 14
 
-            surf.blit(self.viewer.text_cache.render(f"HP: {hp:.2f} / {hp_max:.2f}", 13, COLORS["text_dim"]), (x, y)); y += 20
-            surf.blit(self.viewer.text_cache.render(f"Attack: {atk:.2f}", 13, COLORS["text_dim"]), (x, y)); y += 18
-            surf.blit(self.viewer.text_cache.render(f"Vision: {vision} cells", 13, COLORS["text_dim"]), (x, y)); y += 22
+            for line in (
+                f"HP: {hp:.2f} / {hp_max:.2f}",
+                f"Attack: {atk:.2f}",
+                f"Vision: {vision} cells",
+            ):
+                surf.blit(self.viewer.text_cache.render(line, 13, COLORS["text_dim"]), (x, y))
+                y += 18
 
-            # Model summary and param count if brain exists
             if brain:
-                surf.blit(self.viewer.text_cache.render(f"Model: {_get_model_summary(brain)}", 13, COLORS["text_dim"]), (x, y)); y += 18
-                surf.blit(self.viewer.text_cache.render(f"Params: {_param_count(brain):,}", 13, COLORS["text_dim"]), (x, y)); y += 18
+                surf.blit(self.viewer.text_cache.render(f"Model: {_get_model_summary(brain)}", 13, COLORS["text_dim"]), (x, y))
+                y += 18
+                surf.blit(self.viewer.text_cache.render(f"Params: {_param_count(brain):,}", 13, COLORS["text_dim"]), (x, y))
+                y += 18
 
-        # Separator line
-        pygame.draw.line(surf, COLORS["border"], (srect.x, y + 10), (srect.right, y + 10), 2)
+        return y
 
-        # Legend and controls
+    def _draw_zone_section(self, surf, x, y):
+        y += 18
+        pygame.draw.line(
+            surf,
+            COLORS["border"],
+            (self.viewer.layout.side_rect().x, y),
+            (self.viewer.layout.side_rect().right, y),
+            2,
+        )
+        y += 16
+        surf.blit(self.viewer.text_cache.render("Cell / Zone Inspector", 18, COLORS["text"]), (x, y))
+        y += 30
+
+        info = self.viewer.get_selected_cell_zone_info()
+        if info is None:
+            surf.blit(self.viewer.text_cache.render("Click the world to inspect a cell.", 13, COLORS["text_dim"]), (x, y))
+            return y + 26
+
+        cp_indices = info["cp_indices"]
+        cp_str = ", ".join(f"CP{idx}" for idx in cp_indices) if cp_indices else "None"
+        occupant_line = info.get("occupant_label") or "Occupant: None"
+        lines = [
+            f"Cell: ({info['cell'][0]}, {info['cell'][1]})",
+            f"Terrain: {info['terrain_label']}",
+            occupant_line,
+            f"Base Value: {info['base_value']:+.2f}",
+            f"State: {info['state_label']}",
+            f"CP Masks: {cp_str}",
+            f"Edit Lock: {'Locked' if info['edit_locked'] else 'Unlocked'}",
+            f"Edit Step: ±{self.viewer.base_zone_edit_step:.2f}",
+        ]
+        for line in lines:
+            color = COLORS["text_dim"]
+            if line.startswith("Base Value"):
+                if info["state_label"] == "Beneficial":
+                    color = COLORS["zone_positive"]
+                elif info["state_label"] == "Harmful":
+                    color = COLORS["zone_negative"]
+                else:
+                    color = COLORS["selected"]
+            if line.startswith("Edit Lock") and info["edit_locked"]:
+                color = COLORS["zone_locked"]
+            surf.blit(self.viewer.text_cache.render(line, 13, color), (x, y))
+            y += 18
+
+        status = getattr(self.viewer, "zone_status_message", "")
+        if status:
+            status_color = COLORS.get(getattr(self.viewer, "zone_status_color_key", "text_dim"), COLORS["text_dim"])
+            surf.blit(self.viewer.text_cache.render(status, 13, status_color), (x, y))
+            y += 20
+
+        return y
+
+    def draw(self, surf, state_data):
+        srect = self.viewer.layout.side_rect()
+        surf.fill(COLORS["side_bg"], srect)
+        pygame.draw.rect(surf, COLORS["border"], srect, 2)
+
+        pad = 12
+        x = srect.x + pad
+        y = srect.y + 12
+        y = self._draw_agent_section(surf, x, y, srect, state_data)
+        y = self._draw_zone_section(surf, x, y)
         self._draw_legend(surf, x, y)
-
-
 # ==============================================================================
 # Minimap
 # ==============================================================================
@@ -1244,8 +1270,9 @@ class InputHandler:
     Central event handler for the Viewer.
 
     Responsibilities:
-    - Continuous key state handling (WASD/arrows for panning).
-    - Discrete events (keypress toggles, mouse clicks, resizing, quit).
+    - continuous key state handling (WASD/arrows for panning)
+    - discrete events (keypress toggles, mouse clicks, resizing, quit)
+    - signed-zone inspection / editing hotkeys
     """
 
     def __init__(self, viewer):
@@ -1257,17 +1284,9 @@ class InputHandler:
 
         Returns:
             (running, advance_tick)
-            - running=False means the viewer should exit
-            - advance_tick=True means if paused, we should advance one simulation tick
         """
         running, advance_tick = True, False
-
-        # Continuous keyboard state for smooth camera movement
         keys = pygame.key.get_pressed()
-
-        # Pan speed inversely proportional to zoom (cell size).
-        # If cell is large (zoomed in), we pan less per frame for precision.
-        # If cell is small (zoomed out), we pan more per frame for speed.
         pan_speed = 10.0 / max(1.0, float(self.viewer.cam.cell_px))
 
         if keys[pygame.K_a] or keys[pygame.K_LEFT]:
@@ -1286,36 +1305,23 @@ class InputHandler:
                 running = False
 
             elif ev.type == pygame.VIDEORESIZE:
-                # Only allow resizable mode when not fullscreen
                 if not self.viewer.fullscreen:
                     self.viewer.Wpix, self.viewer.Hpix = max(800, ev.w), max(520, ev.h)
-                    self.viewer.screen = pygame.display.set_mode(
-                        (self.viewer.Wpix, self.viewer.Hpix),
-                        pygame.RESIZABLE
-                    )
-                    # Force background rebuild due to changed world_rect size
+                    self.viewer.screen = pygame.display.set_mode((self.viewer.Wpix, self.viewer.Hpix), pygame.RESIZABLE)
                     self.viewer.world_renderer.static_surf = None
 
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     running = False
-
                 elif ev.key == pygame.K_SPACE:
-                    # Toggle pause
                     self.viewer.paused = not self.viewer.paused
-
                 elif ev.key == pygame.K_PERIOD and self.viewer.paused:
-                    # Single-step when paused
                     advance_tick = True
-
                 elif ev.key == pygame.K_m and self.viewer.selected_slot_id is not None:
-                    # Mark/unmark current selection (max 10 markers)
                     if self.viewer.selected_slot_id in self.viewer.marked:
                         self.viewer.marked.remove(self.viewer.selected_slot_id)
                     elif len(self.viewer.marked) < 10:
                         self.viewer.marked.append(self.viewer.selected_slot_id)
-
-                # Toggle overlays
                 elif ev.key == pygame.K_r:
                     self.viewer.show_rays = not self.viewer.show_rays
                 elif ev.key == pygame.K_t:
@@ -1324,59 +1330,52 @@ class InputHandler:
                     self.viewer.battle_view_enabled = not self.viewer.battle_view_enabled
                 elif ev.key == pygame.K_n:
                     self.viewer.show_brain_types = not self.viewer.show_brain_types
-
-                # Save selected agent brain weights
+                elif ev.key == pygame.K_z:
+                    self.viewer.show_zone_overlay = not self.viewer.show_zone_overlay
+                    self.viewer.world_renderer.static_surf = None
+                    self.viewer.set_zone_status(
+                        f"Signed-zone overlay {'enabled' if self.viewer.show_zone_overlay else 'disabled'}.",
+                        "text_dim",
+                    )
+                elif ev.key == pygame.K_LEFTBRACKET:
+                    self.viewer.adjust_selected_cell_base_zone(-self.viewer.base_zone_edit_step)
+                elif ev.key == pygame.K_RIGHTBRACKET:
+                    self.viewer.adjust_selected_cell_base_zone(self.viewer.base_zone_edit_step)
+                elif ev.key in (pygame.K_0, pygame.K_KP0, pygame.K_BACKSPACE, pygame.K_DELETE):
+                    self.viewer.reset_selected_cell_base_zone()
                 elif ev.key == pygame.K_s:
                     self.viewer.save_selected_brain()
-
-                # Manual checkpoint save request (actual save happens in Viewer.run loop)
                 elif ev.key == pygame.K_F9:
                     self.viewer.save_requested = True
-
-                # Fullscreen toggle
                 elif ev.key == pygame.K_F11:
                     self.viewer.fullscreen = not self.viewer.fullscreen
                     if self.viewer.fullscreen:
                         self.viewer.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
                     else:
-                        self.viewer.screen = pygame.display.set_mode(
-                            (self.viewer.Wpix, self.viewer.Hpix),
-                            pygame.RESIZABLE
-                        )
-                    # Changing window mode affects layout -> rebuild background
+                        self.viewer.screen = pygame.display.set_mode((self.viewer.Wpix, self.viewer.Hpix), pygame.RESIZABLE)
                     self.viewer.world_renderer.static_surf = None
-
-                # Speed multiplier adjustments
                 elif ev.key in (pygame.K_EQUALS, pygame.K_PLUS):
                     self.viewer.speed_multiplier = min(16, self.viewer.speed_multiplier * 2)
                 elif ev.key == pygame.K_MINUS:
                     self.viewer.speed_multiplier = max(0.25, self.viewer.speed_multiplier / 2)
 
             elif ev.type == pygame.MOUSEBUTTONDOWN:
-                # Left click inside world view => select agent
                 if ev.button == 1 and wrect.collidepoint(ev.pos):
-                    # Convert mouse pixel to world cell
-                    gx, gy = self.viewer.cam.screen_to_world(
-                        ev.pos[0] - wrect.x,
-                        ev.pos[1] - wrect.y
-                    )
-
-                    # Use cached id grid for fast picking
+                    gx, gy = self.viewer.cam.screen_to_world(ev.pos[0] - wrect.x, ev.pos[1] - wrect.y)
+                    self.viewer.selected_cell = (int(gx), int(gy))
                     slot_id = self.viewer.fast_grid_pick_slot(gx, gy)
                     self.viewer.selected_slot_id = slot_id if slot_id is not None and slot_id >= 0 else None
-
-                    # Store last selected unique ID (useful if agent dies later)
+                    info = self.viewer.get_selected_cell_zone_info()
+                    if info is not None:
+                        self.viewer.set_zone_status(
+                            f"Selected cell ({gx}, {gy}) {info['state_label'].lower()} {info['base_value']:+.2f}.",
+                            "text_dim",
+                        )
                     if self.viewer.selected_slot_id is not None:
                         if hasattr(self.viewer.registry, "agent_uids"):
-                            self.viewer.last_selected_uid = int(
-                                self.viewer.registry.agent_uids[self.viewer.selected_slot_id].item()
-                            )
+                            self.viewer.last_selected_uid = int(self.viewer.registry.agent_uids[self.viewer.selected_slot_id].item())
                         else:
-                            self.viewer.last_selected_uid = int(
-                                self.viewer.registry.agent_data[self.viewer.selected_slot_id, COL_AGENT_ID].item()
-                            )
-
-                # Mouse wheel zoom
+                            self.viewer.last_selected_uid = int(self.viewer.registry.agent_data[self.viewer.selected_slot_id, COL_AGENT_ID].item())
                 elif ev.button == 4:
                     self.viewer.cam.zoom_at(1.12)
                     self.viewer.world_renderer.static_surf = None
@@ -1385,8 +1384,6 @@ class InputHandler:
                     self.viewer.world_renderer.static_surf = None
 
         return running, advance_tick
-
-
 # ==============================================================================
 # Animation manager (placeholder)
 # ==============================================================================
@@ -1432,107 +1429,94 @@ class Viewer:
     """
     Main application window: runs the Pygame loop and coordinates everything.
 
-    Key features:
-    - Efficient GPU->CPU sampling (state refresh interval).
-    - Camera panning/zooming.
-    - Selection + inspector panel.
-    - Optional visual overlays (HP bars, rays, threat vision, etc.).
-    - Optional checkpointing with atomic saves.
-
-    Checkpointing concept:
-    - "Atomic save" typically means:
-        write checkpoint to temp directory -> rename/move to final name
-      so partial writes don't corrupt the main checkpoint.
+    Patch-3 additions:
+    - signed-zone rendering toggle/state
+    - selected cell inspector state
+    - deterministic manual editing of the canonical base-zone layer
+    - future-safe edit-lock hook support without implementing catastrophe logic
     """
 
     def __init__(self, grid: torch.Tensor, cell_size: Optional[int] = None, show_grid: bool = True):
         _center_window()
-
-        # Pygame init sets up SDL + subsystems
         pygame.init()
         pygame.display.set_caption("Neural Siege")
 
         self.grid = grid
         self.margin = 8
         self.show_grid = show_grid
-
-        # Camera uses cell size in pixels plus world dimensions (W,H in cells)
         self.cam = Camera(int(cell_size or config.CELL_SIZE), grid.shape[2], grid.shape[1])
 
         H, W = grid.shape[1], grid.shape[2]
         side_min_w, hud_h = 280, 126
-
-        # Determine initial window size while respecting display constraints
         try:
             display_info = pygame.display.Info()
             max_w = display_info.current_w - 80
             max_h = display_info.current_h - 120
         except pygame.error:
-            # Safe fallback when display info is unavailable
             max_w, max_h = 1280, 720
 
         world_px_w, world_px_h = W * self.cam.cell_px, H * self.cam.cell_px
         init_w = min(max_w, max(1280, world_px_w + side_min_w + 3 * self.margin))
         init_h = min(max_h, max(720, world_px_h + hud_h + 2 * self.margin))
-
         self.Wpix, self.Hpix = int(init_w), int(init_h)
-
-        # Resizable window mode by default
         self.screen = pygame.display.set_mode((self.Wpix, self.Hpix), pygame.RESIZABLE)
 
         self.text_cache = TextCache()
         self.clock = pygame.time.Clock()
+        self.engine = None
+        self.registry = None
+        self.stats = None
 
-        # Selection state
         self.selected_slot_id: Optional[int] = None
         self.last_selected_uid: Optional[int] = None
+        self.selected_cell: Optional[Tuple[int, int]] = None
         self.marked: List[int] = []
 
-        # Display toggles
         self.show_rays = False
         self.paused = False
         self.threat_vision_mode = False
         self.battle_view_enabled = False
         self.show_brain_types = False
+        self.show_zone_overlay = True
         self.fullscreen = False
         self.speed_multiplier = 1.0
 
-        # Per-agent cumulative scores from PPO rewards (tracked via monkey patch)
         self.agent_scores: Dict[int, float] = collections.defaultdict(float)
+        self.zone_status_message: str = ""
+        self.zone_status_color_key: str = "text_dim"
 
-        # Checkpointing
         self.save_requested: bool = False
         self._ckpt_last_status: str = ""
 
-        # Performance knobs
         self.STATE_REFRESH_EVERY_FRAMES = int(getattr(config, "VIEWER_STATE_REFRESH_EVERY", 2))
         self.PICK_REFRESH_EVERY_FRAMES = int(getattr(config, "VIEWER_PICK_REFRESH_EVERY", 2))
 
-        # Cached CPU data to avoid GPU sync each frame
+        step = float(getattr(config, "VIEWER_BASE_ZONE_EDIT_STEP", 0.25))
+        if not math.isfinite(step) or step <= 0.0:
+            step = 0.25
+        self.base_zone_edit_step = max(0.01, min(1.0, step))
+
         self._cached_state_data = None
         self._cached_id_np = None
         self._cached_occ_np = None
         self._cached_alive_indices: List[int] = []
         self._cached_agent_map: Dict[int, tuple] = {}
-
         self._last_state_refresh_frame = -10
         self._last_pick_refresh_frame = -10
 
-    def save_selected_brain(self):
-        """
-        Save the PyTorch `state_dict` of the selected agent's brain to disk.
+    def set_zone_status(self, message: str, color_key: str = "text_dim") -> None:
+        """Store a short zone-related status line for the side-panel inspector."""
+        self.zone_status_message = str(message)
+        self.zone_status_color_key = str(color_key)
 
-        Notes:
-        - `state_dict()` is the standard PyTorch method returning model weights.
-        - Saved as .pth file.
-        - If no selection or registry not set, returns safely.
-        """
+    def save_selected_brain(self):
+        """Save the PyTorch `state_dict` of the selected agent's brain to disk."""
         if self.selected_slot_id is None or not hasattr(self, "registry"):
             return
 
         brain = self.registry.brains[self.selected_slot_id]
         if brain:
-            tick = self.stats.tick if hasattr(self, "stats") else 0
+            tick = self.stats.tick if hasattr(self, "stats") and self.stats is not None else 0
             uid = self.last_selected_uid if self.last_selected_uid is not None else self.selected_slot_id
             filename = f"brain_agent_{uid}_t_{tick}.pth"
             try:
@@ -1543,20 +1527,8 @@ class Viewer:
             except Exception as e:
                 print(f"[Viewer] Error saving brain: {e}")
 
-    # ----------------------------------------------------------------------
-    # Fast click picking (no GPU sync in the common case)
-    # ----------------------------------------------------------------------
     def fast_grid_pick_slot(self, gx: int, gy: int) -> Optional[int]:
-        """
-        Return the agent slot ID at grid cell (gx, gy) using cached id grid.
-
-        Why:
-        - Reading from GPU tensor per click would force sync and can stutter.
-        - Cached numpy `id_np` avoids GPU reads during user input.
-
-        Fallback:
-        - If cache doesn't exist, do a one-off slow GPU read.
-        """
+        """Return the agent slot ID at grid cell (gx, gy) using the cached id grid."""
         if self._cached_id_np is None:
             try:
                 v = int(self.grid[2, gy, gx].item())
@@ -1567,37 +1539,161 @@ class Viewer:
         if 0 <= gy < self._cached_id_np.shape[0] and 0 <= gx < self._cached_id_np.shape[1]:
             v = int(self._cached_id_np[gy, gx])
             return v if v >= 0 else None
-
         return None
 
-    # ----------------------------------------------------------------------
-    # State refresh (bulk GPU->CPU copy)
-    # ----------------------------------------------------------------------
+    def get_selected_cell_zone_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Return inspection information for the currently selected cell.
+
+        This is the operator-facing truth surface for Patch 3:
+        - cell coordinates
+        - terrain / occupant context
+        - raw canonical base-zone value
+        - qualitative signed-zone label
+        - CP mask membership
+        - future edit-lock state
+        """
+        if self.selected_cell is None:
+            return None
+
+        gx, gy = int(self.selected_cell[0]), int(self.selected_cell[1])
+        H, W = int(self.grid.shape[1]), int(self.grid.shape[2])
+        if not (0 <= gx < W and 0 <= gy < H):
+            return None
+
+        if self._cached_occ_np is not None:
+            occ = int(self._cached_occ_np[gy, gx])
+        else:
+            occ = int(self.grid[0, gy, gx].item())
+
+        terrain_label = "Wall" if occ == 1 else "Traversable"
+        slot_id = self.fast_grid_pick_slot(gx, gy)
+        occupant_label = None
+        occupant_uid = None
+        if slot_id is not None and slot_id in self._cached_agent_map:
+            _ax, _ay, _unit, team, uid, _btype = self._cached_agent_map[slot_id]
+            team_label = "Red" if float(team) == 2.0 else "Blue"
+            occupant_uid = int(uid)
+            occupant_label = f"Occupant: {team_label} Agent #{occupant_uid}"
+        elif occ == 2:
+            occupant_label = "Occupant: Red Agent"
+        elif occ == 3:
+            occupant_label = "Occupant: Blue Agent"
+
+        base_value = 0.0
+        cp_indices: List[int] = []
+        edit_locked = False
+        zones = getattr(self.engine, "zones", None) if self.engine is not None else None
+        if zones is not None:
+            try:
+                if hasattr(zones, "get_base_zone_value_at"):
+                    base_value = float(zones.get_base_zone_value_at(gx, gy))
+                elif getattr(zones, "base_zone_value_map", None) is not None:
+                    base_value = float(zones.base_zone_value_map[gy, gx].item())
+                elif getattr(zones, "heal_mask", None) is not None:
+                    base_value = 1.0 if bool(zones.heal_mask[gy, gx].item()) else 0.0
+            except Exception:
+                base_value = 0.0
+
+            try:
+                if hasattr(zones, "is_base_zone_edit_locked_at"):
+                    edit_locked = bool(zones.is_base_zone_edit_locked_at(gx, gy))
+            except Exception:
+                edit_locked = False
+
+            for idx, mask in enumerate(getattr(zones, "cp_masks", []) or []):
+                try:
+                    if bool(mask[gy, gx].item()):
+                        cp_indices.append(idx)
+                except Exception:
+                    continue
+
+        return {
+            "cell": (gx, gy),
+            "terrain_label": terrain_label,
+            "occupant_label": occupant_label,
+            "occupant_uid": occupant_uid,
+            "slot_id": slot_id,
+            "base_value": float(max(-1.0, min(1.0, base_value))),
+            "state_label": _zone_state_label(base_value),
+            "cp_indices": cp_indices,
+            "edit_locked": bool(edit_locked),
+        }
+
+    def _refresh_zone_render_cache(self) -> None:
+        """Rebuild cached signed-zone render data after a manual edit."""
+        if getattr(self, "world_renderer", None) is not None and self.engine is not None:
+            self.world_renderer.build_static_cache(self.engine)
+        elif getattr(self, "world_renderer", None) is not None:
+            self.world_renderer.static_surf = None
+
+    def _set_selected_cell_base_zone_value(self, new_value: float) -> bool:
+        """
+        Write a new signed value into the canonical base-zone layer for the selected cell.
+
+        Contract:
+        - edits the base layer only
+        - clamps into [-1, +1]
+        - refreshes engine-side cached zone tensors
+        - refreshes the renderer's static signed-zone cache
+        """
+        info = self.get_selected_cell_zone_info()
+        if info is None:
+            self.set_zone_status("Select a world cell before editing zones.", "warn")
+            return False
+        if self.engine is None or getattr(self.engine, "zones", None) is None:
+            self.set_zone_status("No zone container is attached to the running engine.", "warn")
+            return False
+
+        gx, gy = info["cell"]
+        zones = self.engine.zones
+        try:
+            with torch.no_grad():
+                if hasattr(zones, "set_base_zone_value_at"):
+                    stored = float(zones.set_base_zone_value_at(gx, gy, float(new_value), respect_edit_lock=True))
+                else:
+                    base_map = getattr(zones, "base_zone_value_map", None)
+                    if base_map is None:
+                        raise RuntimeError("engine.zones has no canonical base_zone_value_map")
+                    if hasattr(zones, "is_base_zone_edit_locked_at") and zones.is_base_zone_edit_locked_at(gx, gy):
+                        raise RuntimeError(f"base-zone cell ({gx}, {gy}) is locked for manual editing")
+                    base_map[gy, gx] = float(max(-1.0, min(1.0, float(new_value))))
+                    stored = float(base_map[gy, gx].item())
+
+                if hasattr(self.engine, "_ensure_zone_tensors"):
+                    self.engine._ensure_zone_tensors()
+
+            self._refresh_zone_render_cache()
+            self.set_zone_status(
+                f"Cell ({gx}, {gy}) base zone -> {stored:+.2f} ({_zone_state_label(stored).lower()}).",
+                "green",
+            )
+            return True
+        except Exception as ex:
+            self.set_zone_status(f"Base-zone edit blocked: {type(ex).__name__}: {ex}", "warn")
+            return False
+
+    def adjust_selected_cell_base_zone(self, delta: float) -> bool:
+        """Add a signed delta to the selected cell's canonical base-zone value."""
+        info = self.get_selected_cell_zone_info()
+        if info is None:
+            self.set_zone_status("Select a world cell before editing zones.", "warn")
+            return False
+        return self._set_selected_cell_base_zone_value(info["base_value"] + float(delta))
+
+    def reset_selected_cell_base_zone(self) -> bool:
+        """Reset the selected cell's canonical base-zone value to dormant/neutral."""
+        return self._set_selected_cell_base_zone_value(0.0)
+
     def _refresh_state_cpu(self):
         """
         Copy the minimal data needed for rendering/picking from GPU to CPU.
-
-        This is the *core* performance optimization:
-        - Instead of reading many scattered values from GPU each frame,
-          we do a single bulk copy of a small set of tensors.
-
-        Data copied:
-        - grid occupancy channel (channel 0)
-        - grid agent-id channel (channel 2)
-        - alive agent list + columns (x,y,unit,team,uid)
-        - brain type label from registry.brains (Python objects, no GPU sync)
         """
         with torch.no_grad():
-            # Copy full grid to CPU once; then slice channels
             grid_cpu = self.grid.detach().cpu()
-
-            # Convert to numpy views (copy=False encourages view when possible)
             occ_np = grid_cpu[0].numpy().astype(np.int16, copy=False)
             id_np = grid_cpu[2].numpy().astype(np.int32, copy=False)
-
             ad = self.registry.agent_data
-
-            # Alive mask from tensor column
             alive_mask = ad[:, COL_ALIVE] > 0.5
             alive_idx_t = torch.nonzero(alive_mask).squeeze(1)
 
@@ -1606,46 +1702,30 @@ class Viewer:
                 agent_map: Dict[int, tuple] = {}
             else:
                 alive_indices = alive_idx_t.cpu().tolist()
-
-                # Bulk select needed columns for alive agents
                 cols = [COL_X, COL_Y, COL_UNIT, COL_TEAM, COL_AGENT_ID]
                 alive_data = ad.index_select(0, alive_idx_t)[:, cols].detach().cpu().numpy()
                 uid_data = None
                 if hasattr(self.registry, "agent_uids"):
-                    uid_data = (
-                        self.registry.agent_uids
-                        .index_select(0, alive_idx_t)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    uid_data = self.registry.agent_uids.index_select(0, alive_idx_t).detach().cpu().numpy()
 
                 brains = self.registry.brains
-
                 agent_map = {}
                 for k, slot_id in enumerate(alive_indices):
                     x, y, unit, team, uid = alive_data[k]
                     if uid_data is not None:
                         uid = uid_data[k]
-
-                    # Determine short brain label (string) for rendering
                     br = brains[slot_id]
                     if br is None:
                         btype = "?"
                     else:
                         kind = brain_kind_from_module(br)
                         btype = brain_kind_short_label(kind) if kind else "?"
+                    agent_map[slot_id] = (float(x), float(y), float(unit), float(team), float(uid), btype)
 
-                    agent_map[slot_id] = (
-                        float(x), float(y), float(unit), float(team), float(uid), btype
-                    )
-
-            # Save into Viewer fields (used by renderer and picking)
             self._cached_occ_np = occ_np
             self._cached_id_np = id_np
             self._cached_alive_indices = alive_indices
             self._cached_agent_map = agent_map
-
             self._cached_state_data = {
                 "occ_np": self._cached_occ_np,
                 "id_np": self._cached_id_np,
@@ -1653,27 +1733,8 @@ class Viewer:
                 "agent_map": self._cached_agent_map,
             }
 
-    # ----------------------------------------------------------------------
-    # PPO score hook (accumulate per-agent rewards)
-    # ----------------------------------------------------------------------
     def _install_score_hook(self, engine, registry):
-        """
-        Monkey-patch the PPO trainer's record_step() method to collect rewards.
-
-        Why monkey patch?
-        - We want per-agent score display in UI.
-        - We don't want to modify the PPO trainer internals.
-        - This lets us "wrap" the original method.
-
-        Safety requirements:
-        - Must always call original_record_step(*args, **kwargs).
-        - Must not change return value or side effects of PPO trainer.
-
-        Data flow:
-        - PPO passes `agent_ids` (slot indices) and `rewards` to record_step.
-        - We map slots -> unique agent IDs using registry.agent_data[COL_AGENT_ID].
-        - Accumulate into self.agent_scores[uid] += reward.
-        """
+        """Monkey-patch PPO record_step() to collect per-agent rewards for the viewer."""
         if not hasattr(engine, "_ppo") or engine._ppo is None:
             return
 
@@ -1682,28 +1743,20 @@ class Viewer:
         def record_step_with_score_tracking(*args, **kwargs):
             agent_ids = kwargs.get("agent_ids")
             rewards = kwargs.get("rewards")
-
             if agent_ids is not None and rewards is not None and agent_ids.numel() > 0:
                 with torch.no_grad():
                     slot_ids = agent_ids.detach()
-
-                    # Bulk lookup unique ids (GPU->CPU copy). Prefer int64 side-tensor.
                     if hasattr(registry, "agent_uids"):
                         uids = registry.agent_uids.index_select(0, slot_ids).detach().cpu().numpy()
                     else:
                         uids = registry.agent_data.index_select(0, slot_ids)[:, COL_AGENT_ID].detach().cpu().numpy()
                     r = rewards.detach().cpu().numpy()
-
                 for uid, rv in zip(uids, r):
                     self.agent_scores[int(uid)] += float(rv)
-
             return original_record_step(*args, **kwargs)
 
         engine._ppo.record_step = record_step_with_score_tracking
 
-    # ----------------------------------------------------------------------
-    # Main run loop
-    # ----------------------------------------------------------------------
     def run(
         self,
         engine,
@@ -1713,27 +1766,16 @@ class Viewer:
         target_fps: Optional[int] = None,
         run_dir: Optional[str] = None,
     ):
-        """
-        Start the viewer loop.
-
-        Args:
-            engine: simulation engine (must expose run_tick()).
-            registry: agent registry (agent_data tensor, brains list).
-            stats: stats object (tick, red/blue score etc.).
-            tick_limit: stop after this many ticks (0 = unlimited).
-            target_fps: render FPS cap. If None uses config.TARGET_FPS.
-            run_dir: directory for checkpoints. If None, checkpointing disabled.
-        """
+        """Start the viewer loop."""
+        self.engine = engine
         self.registry = registry
         self.stats = stats
 
-        # Lazy import checkpointing only if run_dir provided
         ckpt_mgr = None
         if run_dir is not None:
             from utils.checkpointing import CheckpointManager
             ckpt_mgr = CheckpointManager(Path(run_dir))
 
-        # Initialize components that depend on Viewer existing
         self.layout = LayoutManager(self)
         self.world_renderer = WorldRenderer(self, self.grid, registry)
         self.hud_panel = HudPanel(self, stats)
@@ -1742,41 +1784,28 @@ class Viewer:
         self.anim_manager = AnimationManager()
         self.minimap = Minimap(self)
 
-        # Build cached zone info for background
         self.world_renderer.build_static_cache(engine)
-
-        # Install PPO hook if PPO exists
         self._install_score_hook(engine, registry)
 
         running = True
         frame_count = 0
-
-        # Prime CPU caches once before loop
         self._refresh_state_cpu()
         self._last_state_refresh_frame = frame_count
         self._last_pick_refresh_frame = frame_count
 
         while running:
-            # ------------------------------------------------------------------
-            # 1) Input phase (selection, toggles, camera)
-            # ------------------------------------------------------------------
             running, advance_tick = self.input_handler.handle()
 
-            # ------------------------------------------------------------------
-            # 2) Manual checkpoint save (safe between ticks)
-            # ------------------------------------------------------------------
             if self.save_requested:
                 self.save_requested = False
-
                 if ckpt_mgr is None:
                     self._ckpt_last_status = "Checkpoint save requested but run_dir is not set."
                     print("[checkpoint]", self._ckpt_last_status)
                 else:
                     try:
-                        # Capture viewer state for restore (camera, pause, speed, scores)
                         viewer_state = {
                             "paused": bool(self.paused),
-                            "speed_mult": float(self.speed_multiplier),  # attribute name mismatch noted
+                            "speed_mult": float(self.speed_multiplier),
                             "camera": {
                                 "offset_x": float(getattr(self.cam, "offset_x", 0.0)),
                                 "offset_y": float(getattr(self.cam, "offset_y", 0.0)),
@@ -1784,7 +1813,6 @@ class Viewer:
                             },
                             "agent_scores": dict(self.agent_scores),
                         }
-
                         out_dir = ckpt_mgr.save_atomic(
                             engine=engine,
                             registry=registry,
@@ -1794,47 +1822,29 @@ class Viewer:
                             pinned=bool(getattr(config, "CHECKPOINT_PIN_ON_MANUAL", True)),
                             pin_tag=str(getattr(config, "CHECKPOINT_PIN_TAG", "manual")),
                         )
-
-                        # Prune old checkpoints to keep last N
                         ckpt_mgr.prune_keep_last_n(int(getattr(config, "CHECKPOINT_KEEP_LAST_N", 1)))
-
                         self._ckpt_last_status = f"Checkpoint saved: {out_dir.name}"
                         print("[checkpoint]", self._ckpt_last_status)
                     except Exception as ex:
                         self._ckpt_last_status = f"Checkpoint FAILED: {type(ex).__name__}: {ex}"
                         print("[checkpoint]", self._ckpt_last_status)
 
-            # ------------------------------------------------------------------
-            # 3) Decide how many simulation ticks to run this frame
-            # ------------------------------------------------------------------
             num_ticks_this_frame = 0
-
             if not self.paused:
                 if self.speed_multiplier >= 1:
-                    # Run multiple ticks per frame (fast-forward)
                     num_ticks_this_frame = int(self.speed_multiplier)
                 elif self.speed_multiplier > 0:
-                    # Run less than 1 tick per frame (slow motion)
                     denom = int(1 / self.speed_multiplier)
                     if denom <= 1 or (frame_count % denom) == 0:
                         num_ticks_this_frame = 1
             elif advance_tick:
-                # Single step when paused
                 num_ticks_this_frame = 1
 
-            # ------------------------------------------------------------------
-            # 4) Run simulation ticks
-            # ------------------------------------------------------------------
             for _ in range(num_ticks_this_frame):
                 engine.run_tick()
                 self.hud_panel.update()
-
-                # ------------------------------------------------------------------
-                # 4a) Automatic checkpointing (trigger file + periodic)
-                # ------------------------------------------------------------------
                 if ckpt_mgr is not None:
                     trig = Path(run_dir) / str(getattr(config, "CHECKPOINT_TRIGGER_FILE", "checkpoint.now"))
-
                     ckpt_mgr.maybe_save_trigger_file(
                         trigger_path=trig,
                         engine=engine,
@@ -1844,7 +1854,6 @@ class Viewer:
                         pin_tag=str(getattr(config, "CHECKPOINT_PIN_TAG", "manual")),
                         keep_last_n=int(getattr(config, "CHECKPOINT_KEEP_LAST_N", 1)),
                     )
-
                     ckpt_mgr.maybe_save_periodic(
                         engine=engine,
                         registry=registry,
@@ -1853,40 +1862,28 @@ class Viewer:
                         keep_last_n=int(getattr(config, "CHECKPOINT_KEEP_LAST_N", 1)),
                     )
 
-            # ------------------------------------------------------------------
-            # 5) Refresh CPU state caches if needed (performance-critical)
-            # ------------------------------------------------------------------
             if (frame_count - self._last_state_refresh_frame) >= self.STATE_REFRESH_EVERY_FRAMES:
                 self._refresh_state_cpu()
                 self._last_state_refresh_frame = frame_count
 
-            # Pick refresh is currently tied to full refresh, but kept separate for future tuning
             if (frame_count - self._last_pick_refresh_frame) >= self.PICK_REFRESH_EVERY_FRAMES:
                 self._last_pick_refresh_frame = frame_count
 
             state_data = self._cached_state_data
             if state_data is None:
-                # Extremely unlikely fallback
                 self._refresh_state_cpu()
                 state_data = self._cached_state_data
 
-            # ------------------------------------------------------------------
-            # 6) Render phase
-            # ------------------------------------------------------------------
             self.screen.fill(COLORS["bg"])
             self.world_renderer.draw(self.screen, state_data)
             self.hud_panel.draw(self.screen, state_data)
             self.side_panel.draw(self.screen, state_data)
-
             pygame.display.flip()
-
-            # Cap render FPS
             self.clock.tick(int(target_fps or config.TARGET_FPS))
-
             frame_count += 1
 
-            # Stop condition by tick limit
             if tick_limit > 0 and stats.tick >= tick_limit:
                 running = False
 
         pygame.quit()
+
