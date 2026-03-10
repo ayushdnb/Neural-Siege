@@ -563,6 +563,29 @@ class CheckpointManager:
         grid = getattr(engine, "grid")
         zones = getattr(engine, "zones", None)
 
+        zones_payload = None
+        if zones is not None:
+            cp_masks = list(getattr(zones, "cp_masks", []) or [])
+
+            base_zones_payload = None
+            if hasattr(zones, "checkpoint_base_zones_payload"):
+                base_zones_payload = zones.checkpoint_base_zones_payload()
+            else:
+                base_zone_value_map = getattr(zones, "base_zone_value_map", None)
+                if base_zone_value_map is not None:
+                    base_zones_payload = {"value_map": base_zone_value_map}
+                elif getattr(zones, "heal_mask", None) is not None:
+                    base_zones_payload = {"value_map": getattr(zones, "heal_mask").to(dtype=torch.float32)}
+
+            zones_payload = {
+                # New canonical payload for Patch 1+.
+                "base_zones": _cpuize(base_zones_payload),
+                # Legacy compatibility bridge retained so older checkpoint readers
+                # that only understand heal_mask can still restore positive zones.
+                "heal_mask": _cpuize(getattr(zones, "heal_mask", None)),
+                "cp_masks": _cpuize(cp_masks),
+            }
+
         # Extract brains per slot from registry
         brains_payload = []
         for b in getattr(registry, "brains"):
@@ -589,10 +612,7 @@ class CheckpointManager:
             },
             "world": {
                 "grid": _cpuize(grid),
-                "zones": None if zones is None else {
-                    "heal_mask": _cpuize(getattr(zones, "heal_mask")),
-                    "cp_masks": _cpuize(getattr(zones, "cp_masks")),
-                },
+                "zones": zones_payload,
             },
             "registry": {
                 "agent_data": _cpuize(getattr(registry, "agent_data")),
@@ -1042,12 +1062,26 @@ class CheckpointManager:
         # Import lazily to avoid import cycles
         from engine.mapgen import Zones
 
-        # Move zone tensors to specified device
-        heal_mask = z["heal_mask"].to(device)
-        cp_masks = [t.to(device) for t in z["cp_masks"]]
+        cp_masks = [t.to(device) for t in z.get("cp_masks", [])]
 
-        # Create new Zones object
-        return Zones(heal_mask=heal_mask, cp_masks=cp_masks)
+        # Prefer the new canonical signed base-zone payload.
+        base_payload = z.get("base_zones", None)
+        if isinstance(base_payload, dict) and base_payload.get("value_map", None) is not None:
+            return Zones(
+                base_zone_value_map=base_payload["value_map"].to(device),
+                cp_masks=cp_masks,
+            )
+
+        # Backward-compatibility bridge for older checkpoints that only saved a
+        # heal mask. We reinterpret True as +1.0 in the canonical base-zone map.
+        heal_mask = z.get("heal_mask", None)
+        if heal_mask is not None:
+            return Zones.from_legacy_heal_mask(
+                heal_mask=heal_mask.to(device),
+                cp_masks=cp_masks,
+            )
+
+        return None
 
     @staticmethod
     def _extract_respawn_state(respawner: Any) -> Dict[str, Any]:

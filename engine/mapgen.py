@@ -17,9 +17,9 @@ from __future__ import annotations
 # dataclass provides a clean, declarative way to define data containers.
 from dataclasses import dataclass
 #
-# List and Tuple are used for explicit typing of lists of masks and rectangle
-# bounds.
-from typing import List, Tuple
+# List / Tuple cover rectangular masks, while Dict / Any support explicit
+# checkpoint-bridge helpers on the zone container.
+from typing import Any, Dict, List, Tuple
 #
 # random is Python's standard pseudo-random generator. It is used here for
 # sampling starting points, directions, and rectangle placements.
@@ -74,59 +74,142 @@ import config
 @dataclass
 class Zones:
     """
-    Immutable masks for special tiles (kept off-grid to avoid renderer/engine churn).
+    Canonical semantic-zone container kept off-grid to avoid renderer/engine churn.
 
-    Conceptual intent:
-    ------------------
-    Many simulations need additional “semantic layers” beyond occupancy/hp/id,
-    such as:
-      • healing fields
-      • capture points
-      • hazards
-      • terrain modifiers
+    Patch-1 contract:
+    -----------------
+    The simulation is moving away from a heal-only zone model toward a more
+    general signed base-zone representation. This class is the foundational seam
+    for that refactor:
 
-    One approach is to encode these into extra grid channels. However, adding
-    channels often forces changes across:
-      • rendering pipelines (new colors/sprites)
-      • physics/engine loops (new rules)
-      • serialization formats (more tensors)
-      • observation feature builders (new inputs)
+      • `base_zone_value_map` is the canonical persistent zone field
+      • positive values represent beneficial/heal-like base zones
+      • negative values are reserved for future harmful/poison-like semantics
+      • zero means dormant / no base-zone effect
+      • capture-point logic remains separate in `cp_masks`
 
-    This structure chooses an alternative: store zones as separate boolean masks.
+    Why keep zones off-grid?
+    ------------------------
+    The occupancy / hp / agent-id grid is already heavily coupled to movement,
+    rendering, and observation code. A separate zone container lets the repo grow
+    zone semantics without rewriting those core channels.
+
+    Compatibility policy in this patch:
+    -----------------------------------
+    - `base_zone_value_map` is the new canonical field.
+    - `heal_mask` remains available as a derived compatibility helper so legacy
+      read-only consumers (viewer, old summaries, older checkpoint readers) can
+      still treat positive base zones as classic heal tiles.
+    - Capture-point masks stay boolean and behaviorally unchanged.
 
     Data invariants:
     ---------------
-    • Each mask has shape (H, W) and dtype torch.bool.
-    • Masks should live on config.TORCH_DEVICE (or a specified device), ensuring
-      they can be used in GPU-side computations without unnecessary transfers.
-
-    Fields:
-    -------
-    heal_mask:
-        True where tiles heal hit points (HP). Semantics are defined elsewhere.
-
-    cp_masks:
-        A list of boolean masks, each describing a distinct capture zone patch.
-
-    Note on "immutability":
-    -----------------------
-    Python cannot enforce strict immutability of tensors; the term “immutable”
-    here should be understood as a *convention*: after construction, these masks
-    are intended not to be mutated in-place by downstream systems.
+    • `base_zone_value_map` has shape (H, W), floating dtype, values clamped to
+      [-1, +1].
+    • every CP mask has shape (H, W) and dtype torch.bool.
+    • tensors should live on one device so GPU-side consumers do not need extra
+      host/device transfers.
     """
-    heal_mask: torch.Tensor                  # True where tiles heal HP
+    base_zone_value_map: torch.Tensor        # signed float grid in [-1, +1]
     cp_masks: List[torch.Tensor]             # list of boolean masks for capture patches
+
+    def __post_init__(self) -> None:
+        """
+        Normalize zone tensors into a stable canonical form.
+
+        This is intentionally conservative:
+        - preserve shape
+        - clamp signed values into the advertised range
+        - keep CP masks boolean
+        - fail fast on mismatched shapes
+        """
+        base = self.base_zone_value_map
+        if not torch.is_tensor(base):
+            raise TypeError("base_zone_value_map must be a torch.Tensor")
+        if int(base.ndim) != 2:
+            raise ValueError(
+                f"base_zone_value_map must be rank-2 (H,W), got shape={tuple(base.shape)}"
+            )
+
+        self.base_zone_value_map = base.to(dtype=torch.float32).clamp(-1.0, 1.0)
+
+        H, W = int(self.base_zone_value_map.shape[0]), int(self.base_zone_value_map.shape[1])
+        norm_cp_masks: List[torch.Tensor] = []
+        for i, m in enumerate(list(self.cp_masks or [])):
+            if not torch.is_tensor(m):
+                raise TypeError(f"cp_masks[{i}] must be a torch.Tensor")
+            if tuple(m.shape) != (H, W):
+                raise ValueError(
+                    f"cp_masks[{i}] shape {tuple(m.shape)} does not match base zone shape {(H, W)}"
+                )
+            norm_cp_masks.append(m.bool())
+        self.cp_masks = norm_cp_masks
+
+    @classmethod
+    def from_legacy_heal_mask(
+        cls,
+        *,
+        heal_mask: torch.Tensor,
+        cp_masks: List[torch.Tensor],
+    ) -> "Zones":
+        """
+        Construct canonical signed zones from the legacy heal-mask payload.
+
+        Legacy meaning:
+        - heal_mask == True  -> base-zone value +1.0
+        - heal_mask == False -> base-zone value  0.0
+
+        This is the checkpoint bridge for old worlds saved before the signed-zone
+        foundation existed.
+        """
+        if not torch.is_tensor(heal_mask):
+            raise TypeError("heal_mask must be a torch.Tensor")
+
+        heal_mask_bool = heal_mask.bool()
+        base_zone_value_map = torch.zeros(
+            heal_mask_bool.shape,
+            dtype=torch.float32,
+            device=heal_mask_bool.device,
+        )
+        base_zone_value_map[heal_mask_bool] = 1.0
+        return cls(base_zone_value_map=base_zone_value_map, cp_masks=list(cp_masks or []))
+
+    @property
+    def heal_mask(self) -> torch.Tensor:
+        """
+        Derived legacy compatibility view of positive base zones.
+
+        Important:
+        - this is NOT the canonical storage field anymore
+        - callers that only need old heal semantics can still consume it safely
+        - negative signed zones are intentionally excluded from this view
+        """
+        return self.base_positive_mask
+
+    @property
+    def base_positive_mask(self) -> torch.Tensor:
+        """Return boolean mask of cells with positive base-zone value."""
+        return self.base_zone_value_map > 0.0
+
+    @property
+    def base_negative_mask(self) -> torch.Tensor:
+        """Return boolean mask of cells with negative base-zone value."""
+        return self.base_zone_value_map < 0.0
 
     @property
     def cp_count(self) -> int:
-        """
-        Convenience property: number of capture-point patches.
-
-        Returns:
-        --------
-        The length of cp_masks, i.e. the number of distinct capture zone masks.
-        """
+        """Return the number of distinct capture-point masks."""
         return len(self.cp_masks)
+
+    def checkpoint_base_zones_payload(self) -> Dict[str, Any]:
+        """
+        Return the canonical base-zone payload fragment used for checkpoints.
+
+        The payload is intentionally small and explicit so future layers
+        (catastrophe overrides, viewer edits, derived effective fields) can add
+        their own sections without redefining the base-zone contract.
+        """
+        return {"value_map": self.base_zone_value_map}
 
 
 # ------------------------------------------------------------------------------
@@ -334,7 +417,7 @@ def add_random_walls(
 
 
 # ------------------------------------------------------------------------------
-# Heal & Capture zones (rectangular patches, scaled to grid)
+# Base signed zones (+ legacy heal generation) and capture zones
 # ------------------------------------------------------------------------------
 @torch.no_grad()
 def make_zones(
@@ -348,18 +431,19 @@ def make_zones(
     device: torch.device | None = None,
 ) -> Zones:
     """
-    Create boolean masks for heal zones and capture zones.
+    Create signed base-zone values plus separate capture-zone masks.
 
     Conceptual overview:
     --------------------
     The simulation includes special areas:
-      • Heal zones: cells that provide healing effects.
+      • Base zones: signed scalar tiles that currently originate from legacy
+        heal rectangles and therefore start at +1.0 where active.
       • Capture zones: rectangular “patches” that can be captured/contested.
 
     Rather than encoding these into the occupancy channel, this function produces
-    separate boolean masks, which can be consumed by:
-      • the tick engine (to apply healing or capture rules)
-      • the renderer (to visualize special tiles)
+    separate tensors which can be consumed by:
+      • the tick engine (to apply current heal-like base-zone rules and CP rules)
+      • the renderer (to visualize positive base zones as legacy heal tiles)
       • the observation builder (to expose zone info to agents)
 
     Parameters:
@@ -390,8 +474,15 @@ def make_zones(
     Output:
     -------
     Zones object containing:
-      • heal_mask: shape (H, W), dtype bool
+      • base_zone_value_map: shape (H, W), dtype float32, values in [-1, +1]
       • cp_masks: list of cp_count boolean masks, each shape (H, W)
+
+    Current generation policy:
+    --------------------------
+    Patch 1 keeps map generation behavior as close as possible to the old repo:
+    every legacy heal rectangle simply writes +1.0 into the canonical base-zone
+    field. Negative values are supported by the data model but are not generated
+    here yet.
 
     Overlap semantics:
     ------------------
@@ -406,8 +497,9 @@ def make_zones(
     # Default device: if none provided, use config.TORCH_DEVICE.
     device = device or config.TORCH_DEVICE
 
-    # heal_mask is a single boolean mask accumulating all heal rectangles.
-    heal_mask = torch.zeros((H, W), dtype=torch.bool, device=device)
+    # Canonical signed base-zone field. Patch 1 still seeds it from the legacy
+    # heal-zone generator, so positive tiles are written as +1.0.
+    base_zone_value_map = torch.zeros((H, W), dtype=torch.float32, device=device)
 
     # cp_masks is a list of distinct capture zone masks.
     cp_masks: List[torch.Tensor] = []
@@ -440,7 +532,7 @@ def make_zones(
         return y0, y0 + h_side, x0, x0 + w_side  # (y0, y1, x0, x1)
 
     # --------------------------------------------------------------------------
-    # Heal zones: write True into heal_mask for each sampled rectangle
+    # Legacy heal rectangles: write +1.0 into the canonical base-zone field
     # --------------------------------------------------------------------------
     if heal_count > 0 and heal_ratio > 0.0:
         # Compute rectangle side lengths proportional to grid dimensions.
@@ -451,10 +543,9 @@ def make_zones(
         for _ in range(int(heal_count)):
             y0, y1, x0, x1 = _sample_rect(h_side, w_side)
 
-            # Boolean slicing assignment sets the region to True.
-            # Because heal_mask accumulates all heal zones, repeated assignments
-            # naturally union together (logical OR).
-            heal_mask[y0:y1, x0:x1] = True
+            # Repeated assignments naturally union together because writing the
+            # same +1.0 value over overlapping rectangles is idempotent.
+            base_zone_value_map[y0:y1, x0:x1] = 1.0
 
     # --------------------------------------------------------------------------
     # Capture zones: create a separate mask per rectangle and append to list
@@ -472,5 +563,5 @@ def make_zones(
             m[y0:y1, x0:x1] = True
             cp_masks.append(m)
 
-    # Package into the Zones dataclass and return.
-    return Zones(heal_mask=heal_mask, cp_masks=cp_masks)
+    # Package into the canonical Zones dataclass and return.
+    return Zones(base_zone_value_map=base_zone_value_map, cp_masks=cp_masks)

@@ -227,8 +227,11 @@ class TickEngine:
         self.agent_scores: Dict[int, float] = collections.defaultdict(float)
 
         # Zones and corresponding cached tensors on the simulation device.
+        # Patch 1 canonicalizes base zones as signed floats while preserving a
+        # cached positive-mask view for existing heal semantics / observations.
         self.zones: Optional[Zones] = zones
-        self._z_heal: Optional[torch.Tensor] = None
+        self._z_base_values: Optional[torch.Tensor] = None
+        self._z_base_positive_mask: Optional[torch.Tensor] = None
         self._z_cp_masks: List[torch.Tensor] = []
         self._ensure_zone_tensors()
 
@@ -405,19 +408,36 @@ class TickEngine:
     # -------------------------------------------------------------------------
     def _ensure_zone_tensors(self) -> None:
         """
-        Convert zone masks to tensors on the simulation device.
+        Convert zone tensors to tensors on the simulation device.
 
-        - heal_mask: boolean grid marking cells that heal agents standing on them
-        - cp_masks: list of boolean grids marking capture point regions
+        Patch-1 contract:
+        - `_z_base_values` is the canonical signed float grid in [-1, +1]
+        - `_z_base_positive_mask` preserves current positive/heal semantics
+        - `_z_cp_masks` stays behaviorally identical to the old CP path
+
+        Compatibility bridge:
+        - Prefer `zones.base_zone_value_map` when present
+        - Fall back to legacy `zones.heal_mask` and reinterpret True as +1.0
         """
-        self._z_heal, self._z_cp_masks = None, []
+        self._z_base_values, self._z_base_positive_mask, self._z_cp_masks = None, None, []
         if self.zones is None:
             return
 
         try:
-            # non_blocking=True can allow overlap of copy with CPU work if pinned memory.
-            if getattr(self.zones, "heal_mask", None) is not None:
-                self._z_heal = self.zones.heal_mask.to(self.device, non_blocking=True).bool()
+            base_zone_value_map = getattr(self.zones, "base_zone_value_map", None)
+            if base_zone_value_map is None:
+                legacy_heal_mask = getattr(self.zones, "heal_mask", None)
+                if legacy_heal_mask is not None:
+                    base_zone_value_map = legacy_heal_mask.to(dtype=torch.float32)
+
+            if base_zone_value_map is not None:
+                self._z_base_values = (
+                    base_zone_value_map
+                    .to(self.device, non_blocking=True)
+                    .to(torch.float32)
+                    .clamp(-1.0, 1.0)
+                )
+                self._z_base_positive_mask = self._z_base_values > 0.0
 
             self._z_cp_masks = [
                 m.to(self.device, non_blocking=True).bool()
@@ -426,6 +446,7 @@ class TickEngine:
         except Exception as e:
             # Safety: if zones fail, disable them rather than crash the simulation.
             print(f"[tick] WARN: zone tensor setup failed ({e}); zones disabled.")
+            self._z_base_values, self._z_base_positive_mask, self._z_cp_masks = None, None, []
 
     # -------------------------------------------------------------------------
     # Indexing helper
@@ -974,8 +995,8 @@ class TickEngine:
         N = alive_idx.numel()
 
         # --- Zone flags for rich features ---
-        if self._z_heal is not None:
-            on_heal = self._z_heal[pos_xy[:, 1], pos_xy[:, 0]]
+        if self._z_base_positive_mask is not None:
+            on_heal = self._z_base_positive_mask[pos_xy[:, 1], pos_xy[:, 0]]
         else:
             on_heal = self._obs_on_heal[:N]
             on_heal.zero_()
@@ -1932,19 +1953,31 @@ class TickEngine:
         if (alive_idx := self._recompute_alive_idx()).numel() > 0:
             pos_xy = self.registry.positions_xy(alive_idx)
 
-            # Healing zones
-            if self._z_heal is not None and (on_heal := self._z_heal[pos_xy[:, 1], pos_xy[:, 0]]).any():
-                heal_idx = alive_idx[on_heal]
-                hp_before_heal = data[heal_idx, COL_HP].clone()
-                data[heal_idx, COL_HP] = (data[heal_idx, COL_HP] + config.HEAL_RATE).clamp_max(data[heal_idx, COL_HP_MAX])
-                healed_delta = (data[heal_idx, COL_HP] - hp_before_heal).clamp_min(0.0).to(torch.float32)
-                self.grid[1, pos_xy[on_heal, 1], pos_xy[on_heal, 0]] = data[heal_idx, COL_HP].to(self._grid_dt)
+            # Positive base zones preserve current heal semantics.
+            #
+            # Patch 1 intentionally does NOT activate negative signed-zone damage
+            # yet; it only carries signed values through the data model and runtime
+            # cache. Positive magnitudes already scale the legacy heal rate, so:
+            #   +1.0 -> full old HEAL_RATE
+            #   +0.5 -> half heal rate
+            #    0.0 -> dormant
+            if self._z_base_values is not None:
+                zone_values_now = self._z_base_values[pos_xy[:, 1], pos_xy[:, 0]]
+                if (on_heal := zone_values_now > 0.0).any():
+                    heal_idx = alive_idx[on_heal]
+                    heal_strength = zone_values_now[on_heal].to(self._data_dt)
+                    hp_before_heal = data[heal_idx, COL_HP].clone()
+                    data[heal_idx, COL_HP] = (
+                        data[heal_idx, COL_HP] + (config.HEAL_RATE * heal_strength)
+                    ).clamp_max(data[heal_idx, COL_HP_MAX])
+                    healed_delta = (data[heal_idx, COL_HP] - hp_before_heal).clamp_min(0.0).to(torch.float32)
+                    self.grid[1, pos_xy[on_heal, 1], pos_xy[on_heal, 0]] = data[heal_idx, COL_HP].to(self._grid_dt)
 
-                heal_reward_coef = float(getattr(config, "PPO_REWARD_HEALING_RECOVERY", 0.0))
-                if heal_reward_coef != 0.0 and int(heal_idx.numel()) > 0:
-                    heal_reward = healed_delta * heal_reward_coef
-                    individual_rewards.index_add_(0, heal_idx, heal_reward.to(self._data_dt))
-                    reward_healing_recovered.index_add_(0, heal_idx, heal_reward)
+                    heal_reward_coef = float(getattr(config, "PPO_REWARD_HEALING_RECOVERY", 0.0))
+                    if heal_reward_coef != 0.0 and int(heal_idx.numel()) > 0:
+                        heal_reward = healed_delta * heal_reward_coef
+                        individual_rewards.index_add_(0, heal_idx, heal_reward.to(self._data_dt))
+                        reward_healing_recovered.index_add_(0, heal_idx, heal_reward)
 
             # Metabolism / attrition
             if meta_drain := getattr(config, "METABOLISM_ENABLED", True):
@@ -2158,5 +2191,6 @@ class TickEngine:
 
         # Return metrics as a dict
         return vars(metrics)
+
 
 
