@@ -1616,6 +1616,8 @@ class PerAgentPPORuntime:
         sched_out = {int(aid): cpuize(s.state_dict()) for aid, s in self._sched.items()}
 
         return {
+            "obs_schema_version": int(getattr(config, "OBS_SCHEMA_VERSION", 0)),
+            "obs_schema_family": str(getattr(config, "OBS_SCHEMA_FAMILY", "")),
             "step":  int(self._step),
             "train_update_seq": int(self._train_update_seq),
             "rich_telemetry_row_seq": int(self._rich_telemetry_row_seq),
@@ -1659,6 +1661,22 @@ class PerAgentPPORuntime:
             if isinstance(x, list):
                 return [to_dev(v) for v in x]
             return x
+
+        expected_obs_schema_version = int(getattr(config, "OBS_SCHEMA_VERSION", 0))
+        expected_obs_schema_family = str(getattr(config, "OBS_SCHEMA_FAMILY", "")).strip()
+        got_obs_schema_version = state.get("obs_schema_version", None)
+        got_obs_schema_family = str(state.get("obs_schema_family", "")).strip()
+        if got_obs_schema_version is None:
+            raise RuntimeError(
+                "[ppo] checkpoint is missing obs_schema_version. This usually means the PPO state was saved "
+                "before the signed-zone observation migration and is unsafe to restore under the current policy interface."
+            )
+        if int(got_obs_schema_version) != expected_obs_schema_version or got_obs_schema_family != expected_obs_schema_family:
+            raise RuntimeError(
+                "[ppo] observation schema mismatch while restoring PPO state: "
+                f"checkpoint=({int(got_obs_schema_version)}, {got_obs_schema_family!r}) "
+                f"current=({expected_obs_schema_version}, {expected_obs_schema_family!r})."
+            )
 
         # Restore global step
         self._step = int(state.get("step", 0))
@@ -1880,3 +1898,4 @@ class PerAgentPPORuntime:
         entropy = -(logp.exp() * logp).sum(-1)
 
         return logits, values, entropy
+

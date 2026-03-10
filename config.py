@@ -804,13 +804,70 @@ RICH_TOTAL_DIM  = RICH_BASE_DIM + INSTINCT_DIM
 # Used by brains, runtime buffers, validation checks.
 OBS_DIM = RAYS_FLAT_DIM + RICH_TOTAL_DIM
 
+# -----------------------------------------------------------------------------
+# Observation schema versioning
+# -----------------------------------------------------------------------------
+# This is a POLICY-INTERFACE schema version, not a world/checkpoint tensor version.
+# Increment it whenever observation feature meaning changes in a way that can make
+# previously trained policy weights unsafe even if dimensionality stays constant.
+#
+# Version history:
+#   v1: rich_base[9]  = on_heal_local       (boolean-like 0/1)
+#       rich_base[10] = on_cp_local         (boolean-like 0/1)
+#   v2: rich_base[9]  = zone_effect_local   (signed scalar in [-1, +1])
+#       rich_base[10] = on_cp_local         (boolean-like 0/1)
+OBS_SCHEMA_VERSION: int = 2
+OBS_SCHEMA_FAMILY: str = "signed_zone_scalar_v2"
+
+# Rich-base column contract.
+# These names document the exact order expected by the observation builder,
+# obs_spec, and policy code. Changing order/meaning without coordinated updates
+# is extremely dangerous because PPO can continue "working" while consuming the
+# wrong semantics.
+RICH_BASE_FEATURE_NAMES = (
+    "hp_ratio",             # 0
+    "x_norm",               # 1
+    "y_norm",               # 2
+    "is_red_team",          # 3
+    "is_blue_team",         # 4
+    "is_soldier",           # 5
+    "is_archer",            # 6
+    "atk_norm",             # 7
+    "vision_norm",          # 8
+    "zone_effect_local",    # 9  signed scalar in [-1, +1]
+    "cp_local",             # 10 boolean-like 0/1
+    "tick_norm",            # 11
+    "red_score_norm",       # 12
+    "blue_score_norm",      # 13
+    "red_cp_points_norm",   # 14
+    "blue_cp_points_norm",  # 15
+    "red_kills_norm",       # 16
+    "blue_kills_norm",      # 17
+    "red_deaths_norm",      # 18
+    "blue_deaths_norm",     # 19
+    "pad_0",                # 20
+    "pad_1",                # 21
+    "pad_2",                # 22
+)
+if len(RICH_BASE_FEATURE_NAMES) != int(RICH_BASE_DIM):
+    _config_issue(
+        f"RICH_BASE_FEATURE_NAMES length mismatch: got {len(RICH_BASE_FEATURE_NAMES)} expected {int(RICH_BASE_DIM)}"
+    )
+
+RICH_BASE_ZONE_EFFECT_LOCAL_IDX = 9
+RICH_BASE_CP_LOCAL_IDX = 10
+OBS_ZONE_EFFECT_LOCAL_RANGE = (-1.0, 1.0)
+OBS_CP_LOCAL_RANGE = (0.0, 1.0)
+
 # Semantic grouping of rich-base indices used by tokenized architectures (e.g., Tron/Mirror).
 # Each tuple/list defines which columns of rich_base belong to that semantic token.
 # Changing these indices changes feature semantics without changing dimensionality—very dangerous.
+# zone_context deliberately remains width-2 in v2, but its first element is now a
+# SIGNED scalar local zone effect rather than a boolean heal-local flag.
 SEMANTIC_RICH_BASE_INDICES = {
     "own_context":    (0, 1, 2, 5, 6, 7, 8),
     "world_context":  (11, 20, 21, 22),
-    "zone_context":   (9, 10),
+    "zone_context":   (RICH_BASE_ZONE_EFFECT_LOCAL_IDX, RICH_BASE_CP_LOCAL_IDX),
     "team_context":   (3, 4, 12, 13, 14, 15),
     "combat_context": (16, 17, 18, 19),
 }

@@ -47,6 +47,58 @@ import config
 _IDX_CACHE: Dict[Tuple[torch.device, str], torch.Tensor] = {}
 
 
+def validate_obs_config_contract() -> None:
+    """
+    Validate the configured observation schema contract.
+
+    This is intentionally stricter than a plain shape check. For Patch 2, the
+    most dangerous failure mode is keeping the same dimensionality while drifting
+    semantic meaning. The checks below therefore verify:
+    - overall dimensional arithmetic
+    - documented rich-base column count
+    - the exact zone_context indices expected by the repo
+    - the observation schema version/family markers used for compatibility guards
+    """
+    rays_dim = int(config.RAYS_FLAT_DIM)
+    rich_base_dim = int(config.RICH_BASE_DIM)
+    instinct_dim = int(config.INSTINCT_DIM)
+    rich_total_dim = int(config.RICH_TOTAL_DIM)
+    obs_dim = int(config.OBS_DIM)
+
+    if rich_base_dim + instinct_dim != rich_total_dim:
+        raise RuntimeError(
+            f"RICH_TOTAL_DIM mismatch: rich_base_dim({rich_base_dim}) + instinct_dim({instinct_dim}) != rich_total_dim({rich_total_dim})"
+        )
+    if rays_dim + rich_total_dim != obs_dim:
+        raise RuntimeError(
+            f"OBS_DIM mismatch: rays_dim({rays_dim}) + rich_total_dim({rich_total_dim}) != obs_dim({obs_dim})"
+        )
+
+    feature_names = tuple(getattr(config, "RICH_BASE_FEATURE_NAMES", ()))
+    if len(feature_names) != rich_base_dim:
+        raise RuntimeError(
+            f"RICH_BASE_FEATURE_NAMES mismatch: len={len(feature_names)} expected {rich_base_dim}"
+        )
+
+    expected_zone_context = (
+        int(getattr(config, "RICH_BASE_ZONE_EFFECT_LOCAL_IDX")),
+        int(getattr(config, "RICH_BASE_CP_LOCAL_IDX")),
+    )
+    actual_zone_context = tuple(config.SEMANTIC_RICH_BASE_INDICES.get("zone_context", ()))
+    if actual_zone_context != expected_zone_context:
+        raise RuntimeError(
+            f"zone_context semantic mismatch: got {actual_zone_context}, expected {expected_zone_context}"
+        )
+
+    obs_schema_version = int(getattr(config, "OBS_SCHEMA_VERSION", 0))
+    if obs_schema_version <= 0:
+        raise RuntimeError(f"Invalid OBS_SCHEMA_VERSION: {obs_schema_version}")
+
+    obs_schema_family = str(getattr(config, "OBS_SCHEMA_FAMILY", "")).strip()
+    if not obs_schema_family:
+        raise RuntimeError("OBS_SCHEMA_FAMILY must be a non-empty string")
+
+
 def _idx(name: str, device: torch.device) -> torch.Tensor:
     """
     Get cached index tensor for a semantic token by name.
@@ -73,6 +125,8 @@ def _idx(name: str, device: torch.device) -> torch.Tensor:
         * The same indices must exist separately on CPU vs GPU.
         * The same logical token name maps to the same index list.
     """
+    validate_obs_config_contract()
+
     key = (device, name)
     t = _IDX_CACHE.get(key)
     if t is not None:
@@ -131,6 +185,8 @@ def split_obs_flat(obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch
     - In RL, a single off-by-one slicing error can poison training.
     - These checks turn schema drift into an immediate runtime error.
     """
+    validate_obs_config_contract()
+
     # Enforce rank-2: (B, F). Any other rank indicates an upstream bug.
     if obs.dim() != 2:
         raise RuntimeError(f"obs must be rank-2 (B,F). got shape={tuple(obs.shape)}")
@@ -188,6 +244,10 @@ def split_obs_for_mlp(obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     - Keep the observation schema authoritative in one place.
     - Do NOT duplicate hard-coded slicing logic inside each brain variant.
     - Do NOT change feature ordering or semantic meaning.
+
+    Important Patch 2 semantic note:
+    - rich_base column 9 is now `zone_effect_local`, a signed scalar in [-1, +1].
+    - rich_base column 10 remains `cp_local`, a boolean-like occupancy flag.
     """
     rays_flat, rich_base, instinct = split_obs_flat(obs)
 
@@ -242,6 +302,10 @@ def build_semantic_tokens(
           - "combat_context"
           - "instinct_context"
 
+        For Patch 2, `zone_context` remains width-2 but now means:
+          zone_context[:, 0] = zone_effect_local in [-1, +1]
+          zone_context[:, 1] = cp_local in {0, 1}
+
         Each semantic tensor has shape (B, token_dim), where token_dim depends on how
         many indices are assigned to that token in config.SEMANTIC_RICH_BASE_INDICES.
 
@@ -262,6 +326,8 @@ def build_semantic_tokens(
     - This function enforces strict dimensional checks.
     - It also ensures batch dimension consistency across rich_base and instinct.
     """
+    validate_obs_config_contract()
+
     # Validate rank-2 input: (B, D)
     if rich_base.dim() != 2:
         raise RuntimeError(f"rich_base must be (B,D). got {tuple(rich_base.shape)}")
@@ -302,3 +368,4 @@ def build_semantic_tokens(
     # Add instinct token directly (no indexing required).
     out["instinct_context"] = instinct
     return out
+

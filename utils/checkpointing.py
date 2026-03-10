@@ -286,6 +286,56 @@ def _make_brain(kind: str, device: torch.device) -> torch.nn.Module:
     raise CheckpointError(f"Unknown brain kind in checkpoint: {kind}")
 
 
+
+def _current_observation_schema_payload() -> Dict[str, Any]:
+    """Return the current policy-interface observation schema metadata."""
+    return {
+        "version": int(getattr(config, "OBS_SCHEMA_VERSION", 0)),
+        "family": str(getattr(config, "OBS_SCHEMA_FAMILY", "")),
+        "obs_dim": int(getattr(config, "OBS_DIM", 0)),
+        "rays_flat_dim": int(getattr(config, "RAYS_FLAT_DIM", 0)),
+        "rich_base_dim": int(getattr(config, "RICH_BASE_DIM", 0)),
+        "instinct_dim": int(getattr(config, "INSTINCT_DIM", 0)),
+        "zone_context_indices": tuple(getattr(config, "SEMANTIC_RICH_BASE_INDICES", {}).get("zone_context", ())),
+        "zone_feature_name": str(getattr(config, "RICH_BASE_FEATURE_NAMES", ("",) * 10)[int(getattr(config, "RICH_BASE_ZONE_EFFECT_LOCAL_IDX", 9))]),
+    }
+
+
+def _validate_policy_schema_compat_or_raise(
+    *,
+    checkpoint_schema: Optional[Dict[str, Any]],
+    checkpoint_has_brains: bool,
+    checkpoint_has_ppo: bool,
+) -> None:
+    """
+    Fail loudly when policy-bearing checkpoint payloads target a different observation schema.
+
+    Important distinction:
+    - world tensors (grid / zones / registry occupancy) may still be structurally loadable
+    - policy weights and PPO optimizer state are NOT safe across semantic observation migrations
+    """
+    if not checkpoint_has_brains and not checkpoint_has_ppo:
+        return
+
+    current = _current_observation_schema_payload()
+    if not checkpoint_schema:
+        raise CheckpointError(
+            "Checkpoint is missing observation_schema metadata while also containing policy state. "
+            "This usually indicates a pre-migration checkpoint from the legacy heal-local observation schema. "
+            "World state may still be structurally compatible, but restoring brains/PPO would be unsafe."
+        )
+
+    got_version = int(checkpoint_schema.get("version", -1))
+    got_family = str(checkpoint_schema.get("family", "")).strip()
+    exp_version = int(current["version"])
+    exp_family = str(current["family"])
+    if got_version != exp_version or got_family != exp_family:
+        raise CheckpointError(
+            "Observation schema mismatch for policy-bearing checkpoint payload: "
+            f"checkpoint=({got_version}, {got_family!r}) current=({exp_version}, {exp_family!r}). "
+            "Refusing to restore brains/PPO because semantic drift at the policy interface is unsafe."
+        )
+
 # -----------------------------------------------------------------------------
 # RNG state capture/restore (determinism)
 # -----------------------------------------------------------------------------
@@ -587,6 +637,7 @@ class CheckpointManager:
             }
 
         # Extract brains per slot from registry
+        obs_schema_payload = _current_observation_schema_payload()
         brains_payload = []
         for b in getattr(registry, "brains"):
             if b is None:
@@ -597,7 +648,12 @@ class CheckpointManager:
             # Get brain type and state dict (moved to CPU)
             kind = _infer_brain_kind(b)
             sd = _cpuize(b.state_dict())
-            brains_payload.append({"kind": kind, "state_dict": sd})
+            brains_payload.append({
+                "kind": kind,
+                "state_dict": sd,
+                "obs_schema_version": int(obs_schema_payload["version"]),
+                "obs_schema_family": str(obs_schema_payload["family"]),
+            })
 
         # Main checkpoint dictionary
         ckpt: Dict[str, Any] = {
@@ -609,6 +665,7 @@ class CheckpointManager:
                 "saved_device": str(getattr(grid, "device", "unknown")),
                 "runtime_device": str(getattr(config, "TORCH_DEVICE", "unknown")),
                 "git_commit": _try_git_commit(),
+                "observation_schema": obs_schema_payload,
             },
             "world": {
                 "grid": _cpuize(grid),
@@ -645,6 +702,7 @@ class CheckpointManager:
             "timestamp": stamp,
             "notes": notes,
             "git_commit": ckpt["meta"]["git_commit"],
+            "observation_schema": ckpt["meta"]["observation_schema"],
             "file_list": ["manifest.json", "checkpoint.pt", "DONE"],
             "pinned": bool(pinned),
             "pin_tag": str(pin_tag) if pinned else "",
@@ -987,13 +1045,37 @@ class CheckpointManager:
         # Restore next agent ID
         registry._next_agent_id = int(reg["next_agent_id"])
 
-        # Restore brains per slot
+        # Validate policy-interface observation schema before restoring policy-bearing payloads.
         brains_payload = reg["brains"]
+        checkpoint_has_brains = any(payload is not None for payload in brains_payload)
+        checkpoint_has_ppo = bool(ckpt.get("ppo", {}).get("enabled", False))
+        _validate_policy_schema_compat_or_raise(
+            checkpoint_schema=ckpt.get("meta", {}).get("observation_schema"),
+            checkpoint_has_brains=checkpoint_has_brains,
+            checkpoint_has_ppo=checkpoint_has_ppo,
+        )
+
+        # Restore brains per slot
         for i, payload in enumerate(brains_payload):
             if payload is None:
                 # Empty slot
                 registry.set_brain(i, None)
                 continue
+
+            payload_obs_schema_version = payload.get("obs_schema_version", None)
+            payload_obs_schema_family = str(payload.get("obs_schema_family", "")).strip()
+            current_obs_schema = _current_observation_schema_payload()
+            if payload_obs_schema_version is None:
+                raise CheckpointError(
+                    f"brain payload for slot {i} is missing obs_schema_version. "
+                    "This strongly suggests legacy policy weights from before the signed-zone observation migration."
+                )
+            if int(payload_obs_schema_version) != int(current_obs_schema["version"]) or payload_obs_schema_family != str(current_obs_schema["family"]):
+                raise CheckpointError(
+                    f"brain payload schema mismatch for slot {i}: "
+                    f"checkpoint=({int(payload_obs_schema_version)}, {payload_obs_schema_family!r}) "
+                    f"current=({int(current_obs_schema['version'])}, {str(current_obs_schema['family'])!r})."
+                )
 
             # Create brain of appropriate kind and load state
             b = _make_brain(payload["kind"], device)
@@ -1161,3 +1243,4 @@ class CheckpointManager:
 
         return {"enabled": True, "state": state}
     # =============================================================================
+

@@ -277,9 +277,9 @@ class TickEngine:
         self._reward_contested_cp_individual = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
         self._reward_healing_recovered = torch.zeros(self._capacity, device=self.device, dtype=torch.float32)
 
-        self._obs_on_heal = torch.zeros(self._capacity, device=self.device, dtype=torch.bool)
+        self._obs_zone_effect_local = torch.zeros(self._capacity, device=self.device, dtype=self._data_dt)
         self._obs_on_cp = torch.zeros(self._capacity, device=self.device, dtype=torch.bool)
-        self._obs_rich_base = torch.empty((self._capacity, 23), device=self.device, dtype=self._data_dt)
+        self._obs_rich_base = torch.empty((self._capacity, int(config.RICH_BASE_DIM)), device=self.device, dtype=self._data_dt)
         self._obs_rich = torch.empty(
             (self._capacity, int(self._OBS_DIM) - (32 * 8)),
             device=self.device,
@@ -994,12 +994,13 @@ class TickEngine:
         data = self.registry.agent_data
         N = alive_idx.numel()
 
-        # --- Zone flags for rich features ---
-        if self._z_base_positive_mask is not None:
-            on_heal = self._z_base_positive_mask[pos_xy[:, 1], pos_xy[:, 0]]
+        # --- Local zone features for rich observation tail ---
+        if self._z_base_values is not None:
+            zone_effect_local = self._z_base_values[pos_xy[:, 1], pos_xy[:, 0]].to(self._data_dt)
+            zone_effect_local = zone_effect_local.clamp_(-1.0, 1.0)
         else:
-            on_heal = self._obs_on_heal[:N]
-            on_heal.zero_()
+            zone_effect_local = self._obs_zone_effect_local[:N]
+            zone_effect_local.zero_()
 
         on_cp = self._obs_on_cp[:N]
         on_cp.zero_()
@@ -1033,10 +1034,12 @@ class TickEngine:
         # - normalized positions (x/(W-1), y/(H-1))
         # - one-hot-ish flags for team and unit types
         # - normalized attack and vision
-        # - zone flags
+        # - local zone effect / CP occupancy
         # - normalized global stats
         #
-        # Build the exact same 23-column layout, but write directly into a single
+        # Build the exact same 23-column layout width, but with updated Patch 2
+        # semantics at column 9: zone_effect_local is now a signed scalar in
+        # [-1, +1] rather than a boolean heal-local flag.
         # preallocated tensor to avoid many temporary (N,) vectors each tick.
         rich_base = self._obs_rich_base[:N]
         rich_base[:, 0] = alive_data[:, COL_HP] / hp_max
@@ -1048,8 +1051,8 @@ class TickEngine:
         rich_base[:, 6] = (alive_data[:, COL_UNIT] == 2.0).to(self._data_dt)
         rich_base[:, 7] = alive_data[:, COL_ATK] / (config.MAX_ATK or 1.0)
         rich_base[:, 8] = alive_data[:, COL_VISION] / (config.RAYCAST_MAX_STEPS or 15.0)
-        rich_base[:, 9] = on_heal.to(self._data_dt)
-        rich_base[:, 10] = on_cp.to(self._data_dt)
+        rich_base[:, config.RICH_BASE_ZONE_EFFECT_LOCAL_IDX] = zone_effect_local
+        rich_base[:, config.RICH_BASE_CP_LOCAL_IDX] = on_cp.to(self._data_dt)
         rich_base[:, 11].fill_(float(self.stats.tick) / 50000.0)
         rich_base[:, 12].fill_(float(self.stats.red.score) / 1000.0)
         rich_base[:, 13].fill_(float(self.stats.blue.score) / 1000.0)
@@ -2191,6 +2194,7 @@ class TickEngine:
 
         # Return metrics as a dict
         return vars(metrics)
+
 
 
 

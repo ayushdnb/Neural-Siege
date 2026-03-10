@@ -31,6 +31,10 @@ from __future__ import annotations
 #   rays_raw -> shape (B, 32, 8)
 #   rich_vec -> shape (B, 27)
 #
+#   Important Patch 2 semantic note:
+#   - rich_base[9] is now zone_effect_local ∈ [-1, +1]
+#   - rich_base[10] remains cp_local ∈ {0, 1}
+#
 #   ray_emb_i = Linear(LayerNorm(ray_i)) ∈ R^D
 #   ray_token = mean_i(ray_emb_i) ∈ R^D
 #
@@ -405,6 +409,10 @@ class _BaseMLPBrain(nn.Module):
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
 
+        # Validate the authoritative observation schema contract before this
+        # module caches any layout assumptions locally.
+        obs_spec.validate_obs_config_contract()
+
         # ---------------------------------------------------------------------
         # Observation schema parameters.
         # ---------------------------------------------------------------------
@@ -416,7 +424,13 @@ class _BaseMLPBrain(nn.Module):
         #                 = 256 + 27
         #                 = 283
         #
-        # This matches the observation spec used elsewhere in the project.
+        # The numeric width is unchanged by Patch 2. However, one rich-base
+        # feature changed semantics:
+        #   rich_base[9]: on_heal_local (legacy boolean) -> zone_effect_local (signed scalar)
+        #
+        # That means dimensional compatibility does NOT imply policy compatibility.
+        # This module therefore validates both dimension arithmetic and the shared
+        # schema contract exposed by agent.obs_spec / config.
         self.num_rays = int(getattr(config, "RAY_TOKEN_COUNT", 32))
         self.ray_feat_dim = int(getattr(config, "RAY_FEAT_DIM", 8))
         self.rich_base_dim = int(getattr(config, "RICH_BASE_DIM", 23))
@@ -431,6 +445,7 @@ class _BaseMLPBrain(nn.Module):
         # Why fail fast here?
         # Because if observation layout changes silently but the network still
         # runs, training can degrade or collapse without obvious errors.
+        # This includes semantic drift that preserves width but changes meaning.
         if cfg_obs_dim != expected_obs_dim:
             raise RuntimeError(
                 f"[{self.__class__.__name__}] OBS layout mismatch: expected {expected_obs_dim}, "
